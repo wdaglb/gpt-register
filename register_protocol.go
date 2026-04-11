@@ -54,7 +54,7 @@ type createAccountPayload struct {
 
 // runRegister 负责批量注册的调度、结果聚合和落盘。
 // Why: 这里把并发控制与协议细节解耦，后续即使要增加重试或限速，也不需要改动底层注册请求顺序。
-func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger) error {
+func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, authorizeJobs chan<- accountRecord) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("register 模式下 count 必须大于 0")
 	}
@@ -77,7 +77,7 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 		go func() {
 			defer workers.Done()
 			for range jobs {
-				results <- runRegisterAttempt(parent, cfg, mailClient, logger, workerID)
+				results <- runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
 			}
 		}()
 	}
@@ -94,30 +94,20 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 	success := 0
 	fail := 0
 	var firstErr error
-	var persistErr error
 	for result := range results {
 		switch result.Status {
 		case "ok":
 			success++
 		default:
 			fail++
+			logger.Printf("注册失败账号=%s reason=%s err=%v", result.Email, result.Reason, result.Err)
 			if firstErr == nil && result.Err != nil {
 				firstErr = result.Err
 			}
 		}
-
-		if result.Email == "" {
-			continue
-		}
-		if err := appendRegistrationResult(cfg.accountsFile, result); err != nil && persistErr == nil {
-			persistErr = err
-		}
 	}
 
 	logger.Printf("注册任务结束: success=%d fail=%d output=%s", success, fail, cfg.accountsFile)
-	if persistErr != nil {
-		return persistErr
-	}
 	if success == 0 && fail > 0 {
 		if firstErr != nil {
 			return fmt.Errorf("全部注册失败: %w", firstErr)
@@ -128,8 +118,8 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 }
 
 // runRegisterAttempt 负责单个邮箱租约的一次完整注册尝试。
-// 核心流程：租号 -> 纯协议注册 -> 成功标记 used / 失败归还租约。
-func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, workerID int) registrationAttemptResult {
+// 核心流程：租号 -> 纯协议注册 -> 立即写入 accounts.txt -> 成功标记 used / 失败归还租约。
+func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, authorizeJobs chan<- accountRecord, workerID int) registrationAttemptResult {
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
@@ -155,6 +145,11 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	if err != nil {
 		result.Err = fmt.Errorf("创建协议客户端失败: %w", err)
 		result.Reason = "client_init"
+		if store != nil {
+			if _, writeErr := store.upsertRegistration(result.Email, result.Password, "fail:"+result.Reason, time.Now()); writeErr != nil {
+				result.Err = fmt.Errorf("%v；写入 accounts 失败: %w", result.Err, writeErr)
+			}
+		}
 		returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
 		logger.Printf("%s 初始化失败: %v", prefix, err)
 		return result
@@ -163,15 +158,33 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	if err := client.registerWithProtocol(attemptCtx, cfg, lease, result.Password, mailClient, logger, prefix); err != nil {
 		result.Err = err
 		result.Reason = summarizeFlowReason(err)
+		if store != nil {
+			if _, writeErr := store.upsertRegistration(result.Email, result.Password, "fail:"+result.Reason, time.Now()); writeErr != nil {
+				result.Err = fmt.Errorf("%v；写入 accounts 失败: %w", result.Err, writeErr)
+			}
+		}
 		returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
 		logger.Printf("%s 注册失败: %v", prefix, err)
 		return result
 	}
 
-	markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
 	result.Status = "ok"
 	result.Reason = "ok"
 	result.Err = nil
+	if store != nil {
+		record, writeErr := store.upsertRegistration(result.Email, result.Password, "ok", time.Now())
+		if writeErr != nil {
+			result.Status = "fail"
+			result.Reason = "accounts_write"
+			result.Err = fmt.Errorf("注册成功但写入 accounts 失败: %w", writeErr)
+			logger.Printf("%s 注册成功但写入 accounts 失败: %v", prefix, writeErr)
+			return result
+		}
+		if authorizeJobs != nil {
+			authorizeJobs <- record
+		}
+	}
+	markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
 	logger.Printf("%s 注册成功", prefix)
 	return result
 }

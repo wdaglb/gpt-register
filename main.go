@@ -15,28 +15,31 @@ import (
 type runMode string
 
 const (
-	modeRegister runMode = "register"
-	modeLogin    runMode = "login"
+	modeRegister  runMode = "register"
+	modeAuthorize runMode = "authorize"
+	modePipeline  runMode = "pipeline"
+	modeLogin     runMode = "login"
 )
 
 // config 汇总命令行参数和运行期超时配置。
 // Why: 注册和登录两种模式共享同一套网络、邮箱池与超时参数，集中收口后更容易保证两条链路行为一致。
 type config struct {
-	mode           runMode
-	webMailURL     string
-	email          string
-	password       string
-	userFile       string
-	authDir        string
-	accountsFile   string
-	proxy          string
-	mailbox        string
-	count          int
-	workers        int
-	overallTimeout time.Duration
-	otpTimeout     time.Duration
-	pollInterval   time.Duration
-	requestTimeout time.Duration
+	mode             runMode
+	webMailURL       string
+	email            string
+	password         string
+	userFile         string
+	authDir          string
+	accountsFile     string
+	proxy            string
+	mailbox          string
+	count            int
+	workers          int
+	authorizeWorkers int
+	overallTimeout   time.Duration
+	otpTimeout       time.Duration
+	pollInterval     time.Duration
+	requestTimeout   time.Duration
 }
 
 type loginAccount struct {
@@ -64,12 +67,17 @@ func run(parent context.Context, args []string) error {
 
 	logger := log.New(os.Stdout, "[go-register] ", log.LstdFlags|log.Lmsgprefix)
 	mailClient := newWebMailClient(cfg.webMailURL, cfg.requestTimeout)
+	store := newAccountsStore(cfg.accountsFile)
 
 	switch cfg.mode {
 	case modeRegister:
-		return runRegister(parent, cfg, mailClient, logger)
+		return runRegister(parent, cfg, mailClient, logger, store, nil)
+	case modeAuthorize:
+		return runAuthorizeFromAccounts(parent, cfg, mailClient, logger, store)
+	case modePipeline:
+		return runPipeline(parent, cfg, mailClient, logger, store)
 	case modeLogin:
-		return runLogin(parent, cfg, mailClient, logger)
+		return runLogin(parent, cfg, mailClient, logger, store)
 	default:
 		return fmt.Errorf("不支持的 mode: %s", cfg.mode)
 	}
@@ -77,7 +85,7 @@ func run(parent context.Context, args []string) error {
 
 // runLogin 只负责单账号登录闭环，并把最终结果落到结果文件。
 // Why: 登录链路依赖本地 auth 文件生成，和注册的批量 worker 语义不同，因此显式拆开实现，避免两种流程互相污染。
-func runLogin(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger) error {
+func runLogin(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore) error {
 	account, err := resolveAccount(cfg)
 	if err != nil {
 		return err
@@ -89,16 +97,19 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 
 	result, err := loginWithProtocol(loginCtx, cfg, account, mailClient, logger)
 	if err != nil {
-		if flowErr, ok := asFlowResultError(err); ok {
-			if writeErr := appendAccountResult(cfg.accountsFile, account, "fail", flowErr.reason); writeErr != nil {
+		if store != nil {
+			reason := summarizeFlowReason(err)
+			if _, writeErr := store.upsertOAuthResult(account.email, account.password, "oauth=fail:"+reason, time.Now(), ""); writeErr != nil {
 				return errors.Join(err, writeErr)
 			}
 		}
 		return err
 	}
 
-	if err := appendAccountResult(cfg.accountsFile, account, "ok", ""); err != nil {
-		return err
+	if store != nil {
+		if _, err := store.upsertOAuthResult(account.email, account.password, "oauth=ok", time.Now(), result.AuthFilePath); err != nil {
+			return err
+		}
 	}
 	logger.Printf("授权文件已生成: %s", result.AuthFilePath)
 	logger.Printf("callback=%s", result.CallbackURL)
@@ -111,17 +122,18 @@ func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("go-register", flag.ContinueOnError)
 
 	cfg := config{}
-	fs.StringVar((*string)(&cfg.mode), "mode", envOrDefault("GO_REGISTER_MODE", string(modeRegister)), "执行模式: register/login")
+	fs.StringVar((*string)(&cfg.mode), "mode", envOrDefault("GO_REGISTER_MODE", string(modeRegister)), "执行模式: register/authorize/pipeline/login")
 	fs.StringVar(&cfg.webMailURL, "web-mail-url", envOrDefault("WEB_MAIL_URL", "http://127.0.0.1:8030"), "web_mail 服务地址")
 	fs.StringVar(&cfg.email, "email", "", "OpenAI 账号邮箱；为空时从 user-file 读取")
 	fs.StringVar(&cfg.password, "password", "", "OpenAI 账号密码；为空时从 user-file 读取")
 	fs.StringVar(&cfg.userFile, "user-file", defaultUserFile(), "账号文件路径，支持两行 email/password 或单行 email----password")
 	fs.StringVar(&cfg.authDir, "auth-dir", "auth", "授权文件输出目录")
-	fs.StringVar(&cfg.accountsFile, "accounts-file", "", "结果输出文件；register 默认为 registered_accounts.txt，login 默认为 accounts.txt")
+	fs.StringVar(&cfg.accountsFile, "accounts-file", "", "账号状态文件路径，默认 accounts.txt")
 	fs.StringVar(&cfg.proxy, "proxy", "http://127.0.0.1:7890", "HTTP/HTTPS 代理地址，例如 http://127.0.0.1:7890")
 	fs.StringVar(&cfg.mailbox, "mailbox", "Junk", "验证码轮询优先邮箱目录，默认先查 Junk 再回退 INBOX")
-	fs.IntVar(&cfg.count, "count", 1, "register 模式下的注册数量")
-	fs.IntVar(&cfg.workers, "workers", 1, "register 模式下的并发数")
+	fs.IntVar(&cfg.count, "count", 1, "register/pipeline 模式下的注册数量")
+	fs.IntVar(&cfg.workers, "workers", 1, "register/authorize 模式下的并发数")
+	fs.IntVar(&cfg.authorizeWorkers, "authorize-workers", 1, "pipeline 模式下的授权并发数")
 	fs.DurationVar(&cfg.overallTimeout, "timeout", 4*time.Minute, "整条登录流程超时")
 	fs.DurationVar(&cfg.otpTimeout, "otp-timeout", 90*time.Second, "单次验证码等待超时")
 	fs.DurationVar(&cfg.pollInterval, "poll-interval", 3*time.Second, "验证码轮询间隔")
@@ -132,8 +144,8 @@ func parseConfig(args []string) (config, error) {
 	}
 
 	cfg.mode = runMode(strings.ToLower(strings.TrimSpace(string(cfg.mode))))
-	if cfg.mode != modeRegister && cfg.mode != modeLogin {
-		return config{}, fmt.Errorf("mode 仅支持 register/login")
+	if cfg.mode != modeRegister && cfg.mode != modeAuthorize && cfg.mode != modePipeline && cfg.mode != modeLogin {
+		return config{}, fmt.Errorf("mode 仅支持 register/authorize/pipeline/login")
 	}
 	if cfg.webMailURL == "" {
 		return config{}, fmt.Errorf("web_mail 地址不能为空")
@@ -145,17 +157,16 @@ func parseConfig(args []string) (config, error) {
 		cfg.mailbox = "Junk"
 	}
 	if cfg.accountsFile == "" {
-		if cfg.mode == modeRegister {
-			cfg.accountsFile = "registered_accounts.txt"
-		} else {
-			cfg.accountsFile = "accounts.txt"
-		}
+		cfg.accountsFile = "accounts.txt"
 	}
 	if cfg.count <= 0 {
 		return config{}, fmt.Errorf("count 必须大于 0")
 	}
 	if cfg.workers <= 0 {
 		return config{}, fmt.Errorf("workers 必须大于 0")
+	}
+	if cfg.authorizeWorkers <= 0 {
+		return config{}, fmt.Errorf("authorize-workers 必须大于 0")
 	}
 	if cfg.pollInterval <= 0 {
 		return config{}, fmt.Errorf("poll-interval 必须大于 0")

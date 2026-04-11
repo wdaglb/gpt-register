@@ -21,6 +21,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"golang.org/x/net/html"
 	sentinel "openai-sentinel-go"
 )
 
@@ -159,8 +160,17 @@ type authAPIEnvelope struct {
 	ContinueURL string `json:"continue_url"`
 	Method      string `json:"method"`
 	Page        struct {
-		Type string `json:"type"`
+		Type    string `json:"type"`
+		Payload struct {
+			URL string `json:"url"`
+		} `json:"payload"`
 	} `json:"page"`
+}
+
+type htmlForm struct {
+	ActionURL string
+	Method    string
+	Values    url.Values
 }
 
 // loginWithProtocol 执行已有账号的纯协议 OAuth 登录闭环。
@@ -246,8 +256,8 @@ func generateOAuthSession() oauthSession {
 	}
 }
 
-// completeOAuth 推进到“已完成密码与 OTP 验证”的前端阶段。
-// Note: 当前工程还没补齐 consent/callback 捕获，所以这里暂时只走到最新已验证的前端接口边界。
+// completeOAuth 推进整条纯协议 OAuth 登录链路，直到拿到 localhost callback。
+// Note: 对于落入 add_phone 的账号，这里仍会按业务要求直接失败返回，而不会尝试绕过手机验证。
 func (c *protocolClient) completeOAuth(ctx context.Context, cfg config, account loginAccount, mailClient *webMailClient, logger *log.Logger, session oauthSession) (*protocolLoginResult, error) {
 	bootstrap, err := c.bootstrapLoginPage(ctx, session.AuthURL)
 	if err != nil {
@@ -276,6 +286,8 @@ func (c *protocolClient) completeOAuth(ctx context.Context, cfg config, account 
 	}
 	passwordStep := parseAuthAPIEnvelope(passwordResult.Body)
 	logger.Printf("密码阶段返回: status=%d next=%s", passwordResult.StatusCode, passwordStep.Page.Type)
+
+	currentStep := passwordStep
 
 	if passwordStep.Page.Type == "email_otp_verification" || needsEmailOTP(passwordStep.ContinueURL) || needsEmailOTP(passwordResult.FinalURL) || needsEmailOTP(passwordResult.Location) {
 		logger.Print("检测到邮箱 OTP 挑战，准备收码验证")
@@ -308,9 +320,14 @@ func (c *protocolClient) completeOAuth(ctx context.Context, cfg config, account 
 		if validateStep.Page.Type == "add_phone" {
 			return nil, newFlowResultError("add_phone", fmt.Errorf("当前账号在邮箱验证码后进入 add_phone，必须绑定手机后才能继续"))
 		}
+		currentStep = validateStep
 	}
 
-	return nil, fmt.Errorf("协议链路已推进到最新前端接口，但 consent/callback 仍待继续接入")
+	result, err := c.finalizeOAuth(ctx, logger, session, currentStep)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (c *protocolClient) exchangeCode(ctx context.Context, code, verifier string) (*oauthTokenResponse, error) {
@@ -510,6 +527,312 @@ func parseAuthAPIEnvelope(body string) authAPIEnvelope {
 		envelope.Page.Type = "unknown"
 	}
 	return envelope
+}
+
+// finalizeOAuth 处理 OTP 之后的 consent / callback 阶段，直到拿到 localhost 回调。
+// Why: 无需 add_phone 的账号后半段不再是邮箱密码输入，而是 consent 点击和 302 跳转，因此单独抽成收尾阶段更清晰。
+func (c *protocolClient) finalizeOAuth(ctx context.Context, logger *log.Logger, session oauthSession, step authAPIEnvelope) (*protocolLoginResult, error) {
+	if callbackURL := extractCallbackURLFromEnvelope(step); callbackURL != "" {
+		return buildProtocolLoginResultFromCallback(callbackURL, session.State)
+	}
+	if step.Page.Type == "add_phone" {
+		return nil, newFlowResultError("add_phone", fmt.Errorf("当前账号需要绑定手机后才能继续授权"))
+	}
+
+	nextURL := firstNonEmpty(step.Page.Payload.URL, step.ContinueURL)
+	switch {
+	case step.Page.Type == "sign_in_with_chatgpt_codex_consent" || strings.Contains(strings.ToLower(nextURL), "consent"):
+		logger.Print("检测到 consent 阶段，准备协议点击同意")
+		callbackURL, err := c.confirmConsentAndCaptureCallback(ctx, session.State, nextURL)
+		if err != nil {
+			return nil, newFlowResultError("oauth_consent", err)
+		}
+		return buildProtocolLoginResultFromCallback(callbackURL, session.State)
+	case nextURL != "":
+		if strings.Contains(nextURL, "localhost:1455") {
+			return buildProtocolLoginResultFromCallback(nextURL, session.State)
+		}
+	}
+
+	logger.Print("尝试恢复 OAuth 会话并捕获 localhost callback")
+	callbackURL, err := c.resumeAndCaptureCallback(ctx, session.State)
+	if err != nil {
+		return nil, newFlowResultError("oauth_callback", err)
+	}
+	return buildProtocolLoginResultFromCallback(callbackURL, session.State)
+}
+
+func extractCallbackURLFromEnvelope(step authAPIEnvelope) string {
+	for _, candidate := range []string{step.Page.Payload.URL, step.ContinueURL} {
+		if strings.Contains(candidate, "localhost:1455") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func buildProtocolLoginResultFromCallback(callbackURL, expectedState string) (*protocolLoginResult, error) {
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return nil, fmt.Errorf("解析 callback URL 失败: %w", err)
+	}
+
+	query := parsed.Query()
+	code := query.Get("code")
+	state := query.Get("state")
+	if code == "" || state == "" {
+		return nil, fmt.Errorf("callback 缺少 code/state: %s", callbackURL)
+	}
+	if expectedState != "" && state != expectedState {
+		return nil, fmt.Errorf("callback state 不匹配: got=%s want=%s", state, expectedState)
+	}
+
+	return &protocolLoginResult{
+		CallbackURL: callbackURL,
+		Code:        code,
+		State:       state,
+	}, nil
+}
+
+// confirmConsentAndCaptureCallback 以纯协议方式打开 consent 页、提交表单，并抓取最终 callback。
+func (c *protocolClient) confirmConsentAndCaptureCallback(ctx context.Context, state, consentURL string) (string, error) {
+	if strings.TrimSpace(consentURL) == "" {
+		return c.resumeAndCaptureCallback(ctx, state)
+	}
+
+	pageResult, err := c.doRequest(ctx, requestOptions{
+		Method:        http.MethodGet,
+		URL:           consentURL,
+		AllowRedirect: true,
+		Accept:        auth0AcceptHeader,
+		Referer:       auth0BaseURL,
+		Profile:       profileNavigate,
+	})
+	if err != nil {
+		return "", fmt.Errorf("打开 consent 页面失败: %w", err)
+	}
+
+	if callbackURL := extractCallbackURLFromHTTPResult(pageResult); callbackURL != "" {
+		return callbackURL, nil
+	}
+
+	form, err := extractFirstHTMLForm(pageResult.Body, pageResult.FinalURL)
+	if err != nil {
+		if stateFromPage := extractState(pageResult.Body); stateFromPage != "" {
+			return c.resumeAndCaptureCallback(ctx, stateFromPage)
+		}
+		return c.resumeAndCaptureCallback(ctx, state)
+	}
+
+	submitResult, err := c.submitHTMLForm(ctx, form, pageResult.FinalURL)
+	if err != nil {
+		return "", fmt.Errorf("提交 consent 表单失败: %w", err)
+	}
+
+	if callbackURL := extractCallbackURLFromHTTPResult(submitResult); callbackURL != "" {
+		return callbackURL, nil
+	}
+
+	if nextState := firstNonEmpty(extractState(submitResult.Location), extractState(submitResult.FinalURL), extractState(submitResult.Body), state); nextState != "" {
+		return c.resumeAndCaptureCallback(ctx, nextState)
+	}
+	return "", fmt.Errorf("consent 提交后未捕获到 callback")
+}
+
+func (c *protocolClient) submitHTMLForm(ctx context.Context, form *htmlForm, referer string) (*httpResult, error) {
+	if form == nil {
+		return nil, fmt.Errorf("consent 表单为空")
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(form.Method))
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	options := requestOptions{
+		Method:        method,
+		URL:           form.ActionURL,
+		AllowRedirect: false,
+		Accept:        auth0AcceptHeader,
+		Referer:       referer,
+		Profile:       profileForm,
+	}
+
+	if origin := originFromURL(form.ActionURL); origin != "" {
+		options.Origin = origin
+	}
+
+	switch method {
+	case http.MethodGet:
+		targetURL, err := url.Parse(form.ActionURL)
+		if err != nil {
+			return nil, fmt.Errorf("解析 consent GET action 失败: %w", err)
+		}
+		query := targetURL.Query()
+		for key, values := range form.Values {
+			for _, value := range values {
+				query.Add(key, value)
+			}
+		}
+		targetURL.RawQuery = query.Encode()
+		options.URL = targetURL.String()
+		options.Profile = profileNavigate
+	default:
+		options.ContentType = "application/x-www-form-urlencoded"
+		options.Form = form.Values
+	}
+
+	return c.doRequest(ctx, options)
+}
+
+func extractFirstHTMLForm(rawHTML, baseURL string) (*htmlForm, error) {
+	document, err := html.Parse(strings.NewReader(rawHTML))
+	if err != nil {
+		return nil, fmt.Errorf("解析 consent HTML 失败: %w", err)
+	}
+
+	formNode := findFirstNode(document, func(node *html.Node) bool {
+		return node.Type == html.ElementNode && node.Data == "form"
+	})
+	if formNode == nil {
+		return nil, fmt.Errorf("页面中没有 form")
+	}
+
+	method := strings.ToUpper(attributeValue(formNode, "method"))
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	actionURL := resolveRelativeURL(baseURL, attributeValue(formNode, "action"))
+	values := url.Values{}
+	collectFormValues(formNode, values)
+
+	return &htmlForm{
+		ActionURL: actionURL,
+		Method:    method,
+		Values:    values,
+	}, nil
+}
+
+func collectFormValues(root *html.Node, values url.Values) {
+	if root == nil {
+		return
+	}
+
+	if root.Type == html.ElementNode {
+		switch root.Data {
+		case "input":
+			name := attributeValue(root, "name")
+			if name == "" || attributeExists(root, "disabled") {
+				break
+			}
+			inputType := strings.ToLower(attributeValue(root, "type"))
+			if inputType == "checkbox" || inputType == "radio" {
+				if !attributeExistsWithValue(root, "checked", "") {
+					break
+				}
+			}
+			values.Add(name, attributeValue(root, "value"))
+		case "button":
+			name := attributeValue(root, "name")
+			if name != "" && !attributeExists(root, "disabled") {
+				values.Add(name, attributeValue(root, "value"))
+			}
+		}
+	}
+
+	for child := root.FirstChild; child != nil; child = child.NextSibling {
+		collectFormValues(child, values)
+	}
+}
+
+func findFirstNode(root *html.Node, matcher func(*html.Node) bool) *html.Node {
+	if root == nil {
+		return nil
+	}
+	if matcher(root) {
+		return root
+	}
+	for child := root.FirstChild; child != nil; child = child.NextSibling {
+		if matched := findFirstNode(child, matcher); matched != nil {
+			return matched
+		}
+	}
+	return nil
+}
+
+func attributeValue(node *html.Node, key string) string {
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			return attr.Val
+		}
+	}
+	return ""
+}
+
+func attributeExists(node *html.Node, key string) bool {
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func attributeExistsWithValue(node *html.Node, key, value string) bool {
+	for _, attr := range node.Attr {
+		if strings.EqualFold(attr.Key, key) {
+			if value == "" || attr.Val == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func resolveRelativeURL(baseURL, ref string) string {
+	if strings.TrimSpace(ref) == "" {
+		return baseURL
+	}
+
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return ref
+	}
+	target, err := url.Parse(ref)
+	if err != nil {
+		return ref
+	}
+	return base.ResolveReference(target).String()
+}
+
+func originFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func extractCallbackURLFromHTTPResult(result *httpResult) string {
+	if result == nil {
+		return ""
+	}
+	for _, candidate := range []string{result.Location, result.FinalURL, extractState(result.Body)} {
+		if strings.Contains(candidate, "localhost:1455") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func extractDeviceID(body string) string {
