@@ -18,7 +18,7 @@ type authorizationAttemptResult struct {
 }
 
 // runAuthorizeFromAccounts 从 accounts.txt 中提取待授权账号并批量执行授权。
-func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore) error {
+func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	pending, err := store.listPendingAuthorization()
 	if err != nil {
 		return err
@@ -29,19 +29,19 @@ func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *we
 	}
 
 	logger.Printf("发现 %d 个待授权账号，开始批量授权", len(pending))
-	return runAuthorizeRecords(parent, cfg, mailClient, logger, store, pending, cfg.workers)
+	return runAuthorizeRecords(parent, cfg, mailClient, logger, store, ui, pending, cfg.workers)
 }
 
 // runPipeline 同时运行注册 worker 和授权 worker。
 // Why: 注册成功后立即把账号放入统一状态文件，再交给独立授权 worker 消费，可以避免串行等待放大整体耗时。
-func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore) error {
+func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	authorizeJobs := make(chan accountRecord, maxInt(cfg.authorizeWorkers*2, 1))
 	authorizeResults := make(chan authorizationAttemptResult, maxInt(cfg.authorizeWorkers*2, 1))
 
 	var authorizeWG sync.WaitGroup
-	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, cfg.authorizeWorkers, authorizeJobs, authorizeResults, &authorizeWG)
+	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, ui, cfg.authorizeWorkers, authorizeJobs, authorizeResults, &authorizeWG)
 
-	registerErr := runRegister(parent, cfg, mailClient, logger, store, authorizeJobs)
+	registerErr := runRegister(parent, cfg, mailClient, logger, store, ui, authorizeJobs)
 	close(authorizeJobs)
 	authorizeWG.Wait()
 	close(authorizeResults)
@@ -50,7 +50,7 @@ func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, 
 	fail := 0
 	var firstErr error
 	for result := range authorizeResults {
-		if isOAuthSuccessful(result.OAuthStatus) {
+		if isAuthorizationSuccessful(result) {
 			success++
 			continue
 		}
@@ -74,12 +74,12 @@ func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, 
 	return nil
 }
 
-func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, records []accountRecord, workerCount int) error {
+func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, records []accountRecord, workerCount int) error {
 	jobs := make(chan accountRecord, len(records))
 	results := make(chan authorizationAttemptResult, len(records))
 
 	var workers sync.WaitGroup
-	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, workerCount, jobs, results, &workers)
+	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, ui, workerCount, jobs, results, &workers)
 
 	for _, record := range records {
 		jobs <- record
@@ -92,7 +92,7 @@ func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMail
 	fail := 0
 	var firstErr error
 	for result := range results {
-		if isOAuthSuccessful(result.OAuthStatus) {
+		if isAuthorizationSuccessful(result) {
 			success++
 			continue
 		}
@@ -110,7 +110,9 @@ func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMail
 	return nil
 }
 
-func startAuthorizeWorkers(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, workerCount int, jobs <-chan accountRecord, results chan<- authorizationAttemptResult, wg *sync.WaitGroup) {
+// startAuthorizeWorkers 把授权 worker 的创建与结果投递集中在一起。
+// Why: worker 里除了跑协议，还要同步刷新 TUI 统计，统一放在这里更容易保证 pipeline 和批量授权行为一致。
+func startAuthorizeWorkers(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, workerCount int, jobs <-chan accountRecord, results chan<- authorizationAttemptResult, wg *sync.WaitGroup) {
 	if workerCount <= 0 {
 		workerCount = 1
 	}
@@ -121,10 +123,18 @@ func startAuthorizeWorkers(parent context.Context, cfg config, mailClient *webMa
 		go func() {
 			defer wg.Done()
 			for record := range jobs {
-				results <- runAuthorizeAttempt(parent, cfg, mailClient, logger, store, workerID, record)
+				result := runAuthorizeAttempt(parent, cfg, mailClient, logger, store, workerID, record)
+				ui.RecordAuthorizeFinish(isAuthorizationSuccessful(result))
+				results <- result
 			}
 		}()
 	}
+}
+
+// isAuthorizationSuccessful 统一定义“授权成功”的判定条件。
+// Why: 只有 OAuth 结果为 ok 且整条 worker 没有返回错误时，TUI 统计和批量汇总才能保持一致。
+func isAuthorizationSuccessful(result authorizationAttemptResult) bool {
+	return result.Err == nil && isOAuthSuccessful(result.OAuthStatus)
 }
 
 // runAuthorizeAttempt 负责单个账号的一次 OAuth 授权尝试，并把结果回写到 accounts.txt。

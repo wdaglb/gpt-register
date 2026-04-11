@@ -7,29 +7,195 @@
 - 纯协议注册 OpenAI 账号
 - 纯协议执行 OAuth 授权，生成本地 `auth/` 授权文件
 - 对接本地 `web_mail`，注册阶段按 `account_id` 取码，授权阶段按邮箱取码
-- 支持三种执行模式：
+- 内置 Go 版 `web_mail` 服务，兼容历史 Python 版 HTTP 接口
+- 交互终端下默认进入 TUI 首页（worker 卡片列表）
+- TUI 底部固定展示注册/授权统计与平均注册速度
+- TUI 配置会持久化到项目根目录 `.config.json`
+- 支持五种执行模式：
+  - `webmail`：只启动邮箱池 HTTP 服务
   - `register`：只注册
   - `authorize`：只授权
   - `pipeline`：注册线程与授权线程独立运行，共享 `accounts.txt`
+  - `login`：单账号登录调试
 - 使用线程锁 + 文件锁保护 `accounts.txt`，避免并发写乱
 
 ## 运行前准备
 
-1. 启动 `web_mail` 服务，例如：
+1. 准备邮箱源文件 `emails.txt`，格式如下：
 
-```bash
-/Users/wanz/PycharmProjects/reg2/.venv/bin/python \
-  /Users/wanz/PycharmProjects/reg2/web_mail/email_pool_service.py \
-  --host 127.0.0.1 --port 8030
+```text
+email@example.com----password----client_id----refresh_token
 ```
 
-2. 确认本机代理可访问：
+如果一行里还有额外列，服务会继续保留，并在接口响应的 `extra_fields` 中返回。
+
+2. 启动当前仓库内置的 `web_mail` 服务，例如：
+
+```bash
+/Users/wanz/sdk/go1.26.1/bin/go run . \
+  -mode webmail \
+  -web-mail-host 127.0.0.1 \
+  -web-mail-port 8030 \
+  -web-mail-db email_pool.sqlite3 \
+  -web-mail-emails-file emails.txt
+```
+
+3. 确认本机代理可访问：
 
 ```text
 chatgpt.com
 auth.openai.com
 sentinel.openai.com
 auth-cdn.oaistatic.com
+```
+
+## TUI 运行方式（推荐）
+
+在交互终端里直接运行：
+
+```bash
+/Users/wanz/sdk/go1.26.1/bin/go run . \
+  -accounts-file accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030
+```
+
+启动后默认先进入 **首页（worker 卡片列表）**。首页只展示：
+
+- 系统日志卡片
+- 按当前配置推导出的注册 / 授权 worker 占位卡片
+- 底部统计栏与快捷键提示
+
+按 `c` 进入独立的 **配置页**，在该页内配置：
+
+- `mode`
+- `web-mail-url`
+- `email` / `password`（**仅 `login` 模式使用**）
+- `user-file`（**仅 `login` 模式在未填写 `email/password` 时兜底**）
+- `auth-dir`
+- `accounts-file`
+- `proxy`
+- `mailbox`
+- `count`
+- `workers`
+- `authorize-workers`
+- `timeout`
+- `otp-timeout`
+- `poll-interval`
+- `request-timeout`
+
+配置页可以先点“保存配置”落盘；回到首页后按 `Enter` 或 `Ctrl+S` 开始运行。首页包含：
+
+- 顶部系统日志卡片：汇总主流程与未绑定 worker 的日志
+- 注册 / 授权 worker 卡片：按 worker 展示当前账号、最后状态和最近日志
+- 底部固定统计栏：
+  - 注册成功数量
+  - 注册失败数量
+  - 授权成功数
+  - 授权失败数
+  - 平均注册速度（秒/个）
+
+任务结束后程序会继续停留在首页；此时仍可按 `c` 回到配置页修改参数，并在首页再次开始新任务。
+
+> 注意：`register` / `authorize` / `pipeline` 三种模式都不会读取“登录邮箱 / 登录密码 / 账号文件”。这些字段只服务于 `login` 单账号登录调试。
+
+### TUI 快捷键
+
+| 按键 | 作用 |
+| --- | --- |
+| `Tab` | 首页切换到下一张卡片；配置页内切换到下一个字段 |
+| `Shift+Tab` | 配置页首字段返回首页；其它位置切换到上一个字段 |
+| `左右键` | 首页切换卡片；配置页切换 `mode` |
+| `上下键` | 首页滚动当前焦点卡片日志；配置页切换字段 |
+| `c` | 首页进入配置页 |
+| `Enter` | 首页开始运行；配置页内跳到下一项，或在“保存配置”上提交 |
+| `Ctrl+S` | 首页开始运行；配置页保存配置 |
+| `Ctrl+C` | 退出 |
+
+### TUI 配置持久化
+
+TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
+
+```json
+{
+  "mode": "pipeline",
+  "web-mail-url": "http://127.0.0.1:8030",
+  "email": "",
+  "password": "",
+  "user-file": "user.txt",
+  "auth-dir": "auth",
+  "accounts-file": "accounts.txt",
+  "proxy": "http://127.0.0.1:7890",
+  "mailbox": "Junk",
+  "count": 5,
+  "workers": 2,
+  "authorize-workers": 2,
+  "timeout": "4m0s",
+  "otp-timeout": "1m30s",
+  "poll-interval": "3s",
+  "request-timeout": "20s"
+}
+```
+
+说明：
+
+- 启动 TUI 时会自动读取 `.config.json`
+- 点击“保存配置”或从首页开始运行时，都会自动保存当前页面配置
+- `.config.json` 已加入 `.gitignore`
+- `webmail` 模式不会进入 TUI，因此不会消费这份持久化配置
+
+## 模式 0：只启动 web_mail 服务
+
+该模式会在当前仓库内启动一个兼容历史 Python 版接口的邮箱池 HTTP 服务：
+
+```bash
+/Users/wanz/sdk/go1.26.1/bin/go run . \
+  -mode webmail \
+  -web-mail-host 127.0.0.1 \
+  -web-mail-port 8030 \
+  -web-mail-db /Users/wanz/web/my/gpt/go-register/email_pool.sqlite3 \
+  -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt \
+  -mail-api-base https://www.appleemail.top \
+  -web-mail-lease-timeout-seconds 600
+```
+
+只同步邮箱文件后退出：
+
+```bash
+/Users/wanz/sdk/go1.26.1/bin/go run . \
+  -mode webmail \
+  -web-mail-sync-only \
+  -web-mail-db /Users/wanz/web/my/gpt/go-register/email_pool.sqlite3 \
+  -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt
+```
+
+提供的 HTTP 接口：
+
+- `GET /health`
+- `GET /api/email-pool/stats`
+- `POST /api/email-pool/lease`
+- `POST /api/email-pool/accounts/{id}/mark-used`
+- `POST /api/email-pool/accounts/{id}/return`
+- `GET/POST /api/email-pool/accounts/{id}/latest`
+- `GET/POST /api/email-pool/accounts/by-email/latest`
+- `POST /api/email-pool/sync`
+
+响应结构保持兼容：
+
+```json
+{
+  "ok": true,
+  "data": {}
+}
+```
+
+失败时：
+
+```json
+{
+  "ok": false,
+  "error": "错误信息"
+}
 ```
 
 ## accounts.txt 格式
@@ -57,6 +223,10 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 | `oauth_status` | 授权结果，如 `oauth=pending`、`oauth=ok`、`oauth=fail:add_phone` |
 | `oauth_time` | 最近一次授权完成时间 |
 | `auth_file_path` | 授权成功后生成的本地 auth 文件路径 |
+
+## 非交互 / 脚本模式
+
+当输出被重定向、运行在非交互终端，或你明确想走脚本方式时，仍可直接通过 CLI 参数控制模式和并发。
 
 ## 模式 1：只注册
 
@@ -141,13 +311,20 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 
 | 参数 | 说明 |
 | --- | --- |
-| `-mode` | `register` / `authorize` / `pipeline` / `login` |
+| `-mode` | `webmail` / `register` / `authorize` / `pipeline` / `login`。交互终端下会被 TUI 页面中的 mode 覆盖，`webmail` 模式固定走 CLI |
 | `-accounts-file` | 统一账号状态文件，默认 `accounts.txt` |
 | `-web-mail-url` | `web_mail` 服务地址，默认 `http://127.0.0.1:8030` |
+| `-web-mail-host` | `webmail` 模式监听地址，默认 `127.0.0.1` |
+| `-web-mail-port` | `webmail` 模式监听端口，默认 `8030` |
+| `-web-mail-db` | `webmail` 模式 SQLite 文件路径，默认项目根目录 `email_pool.sqlite3` |
+| `-web-mail-emails-file` | `webmail` 模式邮箱源文件路径，默认项目根目录 `emails.txt` |
+| `-mail-api-base` | `webmail` 模式上游邮件接口基础地址，默认 `https://www.appleemail.top` |
+| `-web-mail-sync-only` | `webmail` 模式只同步一次邮箱文件后退出 |
+| `-web-mail-lease-timeout-seconds` | `webmail` 模式租约超时秒数，默认 `600` |
 | `-proxy` | HTTP/HTTPS 代理地址 |
-| `-count` | 注册数量，仅 `register` / `pipeline` 生效 |
-| `-workers` | 注册并发数，或 `authorize` 模式的授权并发数 |
-| `-authorize-workers` | `pipeline` 模式下的授权并发数 |
+| `-count` | 注册数量，仅 `register` / `pipeline` 生效。交互终端下会被 TUI 页面中的 count 覆盖 |
+| `-workers` | 注册并发数，或 `authorize` 模式的授权并发数。交互终端下会被 TUI 页面中的 workers 覆盖 |
+| `-authorize-workers` | `pipeline` 模式下的授权并发数。交互终端下会被 TUI 页面中的 authorize-workers 覆盖 |
 | `-mailbox` | 优先轮询的邮箱目录，默认 `Junk` |
 | `-otp-timeout` | 单次验证码等待时间 |
 | `-poll-interval` | 收码轮询间隔 |
@@ -155,9 +332,15 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 | `-request-timeout` | 单次 HTTP 请求超时 |
 | `-auth-dir` | 授权文件输出目录，默认 `auth` |
 
-## 控制台输出
+## 运行输出
 
-现在批量模式会在控制台直接打印失败原因，例如：
+交互终端下默认使用 TUI：
+
+- `logger` 日志会按系统卡片和 worker 卡片拆分展示
+- 失败原因会直接显示在对应卡片的最近日志里
+- 底部统计栏会持续更新注册/授权结果
+
+非交互 / 脚本模式下，仍会直接输出普通日志，例如：
 
 ```text
 注册失败账号=demo@example.com reason=create_account err=...
@@ -167,6 +350,7 @@ pipeline 授权失败账号=demo@example.com status=oauth=fail:add_phone err=...
 
 ## 说明
 
+- 当前仓库已经内置 Go 版 `web_mail` 服务，不再依赖外部 Python `email_pool_service.py`
 - 注册模式严格按 `http_register.py` 的顺序推进：拿注册会话 → 提交邮箱 → 设置密码 → 发验证码 → 收码 → 验证 → `create_account`
 - OAuth 模式会继续推进：邮箱 → 密码 → 邮箱 OTP → consent / callback → `oauth/token`
 - 对于落入 `add_phone` 的账号，当前会明确标记失败，不尝试绕过手机验证

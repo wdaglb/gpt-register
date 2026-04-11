@@ -53,8 +53,8 @@ type createAccountPayload struct {
 }
 
 // runRegister 负责批量注册的调度、结果聚合和落盘。
-// Why: 这里把并发控制与协议细节解耦，后续即使要增加重试或限速，也不需要改动底层注册请求顺序。
-func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, authorizeJobs chan<- accountRecord) error {
+// Why: 这里把并发控制、TUI 统计更新和协议细节解耦，后续即使要增加重试或限速，也不需要改动底层注册请求顺序。
+func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeJobs chan<- accountRecord) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("register 模式下 count 必须大于 0")
 	}
@@ -77,7 +77,10 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 		go func() {
 			defer workers.Done()
 			for range jobs {
-				results <- runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
+				ui.RecordRegisterStart()
+				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
+				ui.RecordRegisterFinish(result.Status == "ok")
+				results <- result
 			}
 		}()
 	}
@@ -163,7 +166,14 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 				result.Err = fmt.Errorf("%v；写入 accounts 失败: %w", result.Err, writeErr)
 			}
 		}
-		returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
+		if shouldKeepRegisterLeaseOnInvalidAuthStep(err) {
+			// Why: invalid_auth_step 出现在注册密码阶段时，说明该邮箱的注册会话已经走到不可复用状态，
+			// 继续归还到池里只会让后续 worker 反复租到同一个坏邮箱，因此这里直接标记为已使用并移出池子。
+			markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
+			logger.Printf("%s 注册密码阶段命中 invalid_auth_step，邮箱已移出池子", prefix)
+		} else {
+			returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
+		}
 		logger.Printf("%s 注册失败: %v", prefix, err)
 		return result
 	}
@@ -503,6 +513,16 @@ func summarizeFlowReason(err error) string {
 		return message[:120]
 	}
 	return message
+}
+
+// shouldKeepRegisterLeaseOnInvalidAuthStep 判断注册失败是否需要把邮箱移出池子而不是归还。
+// Why: 只有“注册密码阶段 + invalid_auth_step”这一类失败会稳定复现且不可重试，必须避免邮箱被重新租出。
+func shouldKeepRegisterLeaseOnInvalidAuthStep(err error) bool {
+	flowErr, ok := asFlowResultError(err)
+	if !ok || flowErr == nil || strings.TrimSpace(flowErr.reason) != "user_register" {
+		return false
+	}
+	return strings.Contains(flowErr.Error(), "invalid_auth_step")
 }
 
 // returnAccountWithCleanup 在主流程失败后归还邮箱租约。

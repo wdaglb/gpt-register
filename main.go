@@ -19,27 +19,35 @@ const (
 	modeAuthorize runMode = "authorize"
 	modePipeline  runMode = "pipeline"
 	modeLogin     runMode = "login"
+	modeWebMail   runMode = "webmail"
 )
 
 // config 汇总命令行参数和运行期超时配置。
 // Why: 注册和登录两种模式共享同一套网络、邮箱池与超时参数，集中收口后更容易保证两条链路行为一致。
 type config struct {
-	mode             runMode
-	webMailURL       string
-	email            string
-	password         string
-	userFile         string
-	authDir          string
-	accountsFile     string
-	proxy            string
-	mailbox          string
-	count            int
-	workers          int
-	authorizeWorkers int
-	overallTimeout   time.Duration
-	otpTimeout       time.Duration
-	pollInterval     time.Duration
-	requestTimeout   time.Duration
+	mode                       runMode
+	webMailURL                 string
+	webMailHost                string
+	webMailPort                int
+	webMailDBPath              string
+	webMailEmailsFile          string
+	mailAPIBase                string
+	webMailSyncOnly            bool
+	webMailLeaseTimeoutSeconds int
+	email                      string
+	password                   string
+	userFile                   string
+	authDir                    string
+	accountsFile               string
+	proxy                      string
+	mailbox                    string
+	count                      int
+	workers                    int
+	authorizeWorkers           int
+	overallTimeout             time.Duration
+	otpTimeout                 time.Duration
+	pollInterval               time.Duration
+	requestTimeout             time.Duration
 }
 
 type loginAccount struct {
@@ -48,36 +56,57 @@ type loginAccount struct {
 }
 
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
-		log.Printf("执行失败: %v", err)
+	usedTUI, err := run(context.Background(), os.Args[1:])
+	if err != nil {
+		// Why: TUI 模式下错误已经写入滚动日志区，主进程这里不再额外向终端直出，避免退出时再刷一遍原始日志。
+		if !usedTUI {
+			log.Printf("执行失败: %v", err)
+		}
 		os.Exit(1)
 	}
 }
 
 // run 负责把命令行解析、日志初始化和模式分发三件事串起来。
 // Why: 入口保持很薄，后续无论新增 register/login 之外的模式，变更点都能稳定收敛在这里。
-func run(parent context.Context, args []string) error {
+func run(parent context.Context, args []string) (bool, error) {
 	cfg, err := parseConfig(args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 
-	logger := log.New(os.Stdout, "[go-register] ", log.LstdFlags|log.Lmsgprefix)
+	if cfg.mode == modeWebMail {
+		ui := newPlainProgressUI(os.Stdout)
+		logger := log.New(ui.LogWriter(), "[go-register] ", log.LstdFlags|log.Lmsgprefix)
+		return false, runWebMailServer(parent, cfg, logger)
+	}
+
 	mailClient := newWebMailClient(cfg.webMailURL, cfg.requestTimeout)
 	store := newAccountsStore(cfg.accountsFile)
 
+	if shouldUseTUI(cfg) {
+		return true, runWithTUI(parent, cfg, mailClient, store)
+	}
+
+	ui := newPlainProgressUI(os.Stdout)
+	logger := log.New(ui.LogWriter(), "[go-register] ", log.LstdFlags|log.Lmsgprefix)
+	return false, executeMode(parent, cfg, mailClient, logger, store, ui)
+}
+
+// executeMode 统一分发各运行模式，避免普通日志模式和 TUI 模式复制一份业务入口。
+// Why: UI 渲染只是表现层差异，真正的注册/授权逻辑应共用同一条调度链路，避免后续改业务时漏改某个入口。
+func executeMode(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	switch cfg.mode {
 	case modeRegister:
-		return runRegister(parent, cfg, mailClient, logger, store, nil)
+		return runRegister(parent, cfg, mailClient, logger, store, ui, nil)
 	case modeAuthorize:
-		return runAuthorizeFromAccounts(parent, cfg, mailClient, logger, store)
+		return runAuthorizeFromAccounts(parent, cfg, mailClient, logger, store, ui)
 	case modePipeline:
-		return runPipeline(parent, cfg, mailClient, logger, store)
+		return runPipeline(parent, cfg, mailClient, logger, store, ui)
 	case modeLogin:
-		return runLogin(parent, cfg, mailClient, logger, store)
+		return runLogin(parent, cfg, mailClient, logger, store, ui)
 	default:
 		return fmt.Errorf("不支持的 mode: %s", cfg.mode)
 	}
@@ -85,7 +114,7 @@ func run(parent context.Context, args []string) error {
 
 // runLogin 只负责单账号登录闭环，并把最终结果落到结果文件。
 // Why: 登录链路依赖本地 auth 文件生成，和注册的批量 worker 语义不同，因此显式拆开实现，避免两种流程互相污染。
-func runLogin(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore) error {
+func runLogin(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	account, err := resolveAccount(cfg)
 	if err != nil {
 		return err
@@ -97,6 +126,7 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 
 	result, err := loginWithProtocol(loginCtx, cfg, account, mailClient, logger)
 	if err != nil {
+		ui.RecordAuthorizeFinish(false)
 		if store != nil {
 			reason := summarizeFlowReason(err)
 			if _, writeErr := store.upsertOAuthResult(account.email, account.password, "oauth=fail:"+reason, time.Now(), ""); writeErr != nil {
@@ -106,6 +136,7 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 		return err
 	}
 
+	ui.RecordAuthorizeFinish(true)
 	if store != nil {
 		if _, err := store.upsertOAuthResult(account.email, account.password, "oauth=ok", time.Now(), result.AuthFilePath); err != nil {
 			return err
@@ -122,8 +153,15 @@ func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("go-register", flag.ContinueOnError)
 
 	cfg := config{}
-	fs.StringVar((*string)(&cfg.mode), "mode", envOrDefault("GO_REGISTER_MODE", string(modeRegister)), "执行模式: register/authorize/pipeline/login")
+	fs.StringVar((*string)(&cfg.mode), "mode", envOrDefault("GO_REGISTER_MODE", string(modeRegister)), "执行模式: register/authorize/pipeline/login/webmail")
 	fs.StringVar(&cfg.webMailURL, "web-mail-url", envOrDefault("WEB_MAIL_URL", "http://127.0.0.1:8030"), "web_mail 服务地址")
+	fs.StringVar(&cfg.webMailHost, "web-mail-host", envOrDefault("WEB_MAIL_HOST", "127.0.0.1"), "web_mail 服务监听地址，仅 webmail 模式生效")
+	fs.IntVar(&cfg.webMailPort, "web-mail-port", 8030, "web_mail 服务监听端口，仅 webmail 模式生效")
+	fs.StringVar(&cfg.webMailDBPath, "web-mail-db", envOrDefault("WEB_MAIL_DB", defaultProjectFile("email_pool.sqlite3")), "web_mail SQLite 数据库文件，仅 webmail 模式生效")
+	fs.StringVar(&cfg.webMailEmailsFile, "web-mail-emails-file", envOrDefault("WEB_MAIL_EMAILS_FILE", defaultProjectFile("emails.txt")), "邮箱源文件路径，仅 webmail 模式生效")
+	fs.StringVar(&cfg.mailAPIBase, "mail-api-base", envOrDefault("MAIL_API_BASE", defaultMailAPIBaseURL), "上游邮件接口基础地址，仅 webmail 模式生效")
+	fs.BoolVar(&cfg.webMailSyncOnly, "web-mail-sync-only", false, "仅执行一次邮箱同步后退出，仅 webmail 模式生效")
+	fs.IntVar(&cfg.webMailLeaseTimeoutSeconds, "web-mail-lease-timeout-seconds", defaultWebMailLeaseTimeoutSeconds, "邮箱租约超时秒数，仅 webmail 模式生效")
 	fs.StringVar(&cfg.email, "email", "", "OpenAI 账号邮箱；为空时从 user-file 读取")
 	fs.StringVar(&cfg.password, "password", "", "OpenAI 账号密码；为空时从 user-file 读取")
 	fs.StringVar(&cfg.userFile, "user-file", defaultUserFile(), "账号文件路径，支持两行 email/password 或单行 email----password")
@@ -143,12 +181,39 @@ func parseConfig(args []string) (config, error) {
 		return config{}, err
 	}
 
+	return normalizeConfig(cfg)
+}
+
+// normalizeConfig 统一执行配置归一化与合法性校验。
+// Why: 现在 CLI 参数和 TUI 页面都能生成运行配置，公共规则必须收敛到一个函数，避免两边出现不一致。
+func normalizeConfig(cfg config) (config, error) {
 	cfg.mode = runMode(strings.ToLower(strings.TrimSpace(string(cfg.mode))))
-	if cfg.mode != modeRegister && cfg.mode != modeAuthorize && cfg.mode != modePipeline && cfg.mode != modeLogin {
-		return config{}, fmt.Errorf("mode 仅支持 register/authorize/pipeline/login")
+	if cfg.mode != modeRegister && cfg.mode != modeAuthorize && cfg.mode != modePipeline && cfg.mode != modeLogin && cfg.mode != modeWebMail {
+		return config{}, fmt.Errorf("mode 仅支持 register/authorize/pipeline/login/webmail")
 	}
 	if cfg.webMailURL == "" {
 		return config{}, fmt.Errorf("web_mail 地址不能为空")
+	}
+	if cfg.webMailHost == "" {
+		cfg.webMailHost = "127.0.0.1"
+	}
+	if cfg.webMailPort <= 0 {
+		cfg.webMailPort = 8030
+	}
+	if cfg.webMailPort > 65535 {
+		return config{}, fmt.Errorf("web-mail-port 必须在 1~65535 之间")
+	}
+	if cfg.webMailDBPath == "" {
+		cfg.webMailDBPath = defaultProjectFile("email_pool.sqlite3")
+	}
+	if cfg.webMailEmailsFile == "" {
+		cfg.webMailEmailsFile = defaultProjectFile("emails.txt")
+	}
+	if cfg.mailAPIBase == "" {
+		cfg.mailAPIBase = defaultMailAPIBaseURL
+	}
+	if cfg.webMailLeaseTimeoutSeconds <= 0 {
+		cfg.webMailLeaseTimeoutSeconds = defaultWebMailLeaseTimeoutSeconds
 	}
 	if cfg.authDir == "" {
 		return config{}, fmt.Errorf("auth-dir 不能为空")
@@ -182,6 +247,8 @@ func parseConfig(args []string) (config, error) {
 	}
 
 	cfg.authDir = filepath.Clean(cfg.authDir)
+	cfg.webMailDBPath = filepath.Clean(cfg.webMailDBPath)
+	cfg.webMailEmailsFile = filepath.Clean(cfg.webMailEmailsFile)
 	return cfg, nil
 }
 
@@ -247,6 +314,16 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// defaultProjectFile 返回当前工作目录下的默认项目文件绝对路径。
+// Why: webmail 服务既支持显式传参，也需要在仓库内自洽运行，因此默认值直接指向当前项目根目录更直观。
+func defaultProjectFile(name string) string {
+	workDir, err := os.Getwd()
+	if err != nil {
+		return name
+	}
+	return filepath.Join(workDir, name)
 }
 
 func appendAccountResult(path string, account loginAccount, status, reason string) error {
