@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -18,9 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 const (
@@ -29,10 +28,16 @@ const (
 	emailPoolStatusAvailable          = "available"
 	emailPoolStatusLeased             = "leased"
 	emailPoolStatusUsed               = "used"
-	emailPoolBusyRetryCount           = 5
-	emailPoolBusyRetryDelay           = 200 * time.Millisecond
 	emailPoolReclaimCheckInterval     = 3 * time.Second
-	emailPoolSelectColumns            = "id, email, password, client_id, refresh_token, status, lease_token, leased_at, used_at, source_updated_at, created_at, updated_at, extra_fields_json"
+	emailPoolFieldDelimiter           = "----"
+	emailPoolMetadataLeaseToken       = "lease_token"
+	emailPoolMetadataLeasedAt         = "leased_at"
+	emailPoolMetadataUsedAt           = "used_at"
+	emailPoolMetadataStatus           = "status"
+	emailPoolLegacyMetadataID         = "id"
+	emailPoolLegacyMetadataCreatedAt  = "created_at"
+	emailPoolLegacyMetadataUpdatedAt  = "updated_at"
+	emailPoolLegacyMetadataSourceTime = "source_updated_at"
 )
 
 var emailPoolValidMailboxes = map[string]struct{}{
@@ -40,18 +45,41 @@ var emailPoolValidMailboxes = map[string]struct{}{
 	"Junk":  {},
 }
 
+var emailPoolManagedMetadataKeys = map[string]struct{}{
+	emailPoolMetadataLeaseToken:       {},
+	emailPoolMetadataLeasedAt:         {},
+	emailPoolMetadataUsedAt:           {},
+	emailPoolMetadataStatus:           {},
+	emailPoolLegacyMetadataID:         {},
+	emailPoolLegacyMetadataCreatedAt:  {},
+	emailPoolLegacyMetadataUpdatedAt:  {},
+	emailPoolLegacyMetadataSourceTime: {},
+}
+
 // emailPoolLine 表示 emails.txt 中解析出的单行邮箱记录。
-// Why: 先把文本行转换成稳定结构，再做数据库同步，能把“文件格式错误”和“状态写入失败”明确分层。
+// Why: 文本文件既承载基础账号信息，也承载运行期状态后缀，因此这里把“字段值”和“字段是否显式出现”同时记录下来，后续才能正确做状态继承。
 type emailPoolLine struct {
 	Email        string
 	Password     string
 	ClientID     string
 	RefreshToken string
 	ExtraFields  []string
+
+	Status    string
+	HasStatus bool
+
+	LeaseToken    *string
+	HasLeaseToken bool
+
+	LeasedAt    *string
+	HasLeasedAt bool
+
+	UsedAt    *string
+	HasUsedAt bool
 }
 
-// emailPoolRecord 表示 SQLite 中的一条邮箱记录。
-// Why: 服务端既要对外返回公共字段，也要保留内部状态字段，因此先收敛为一个完整记录模型更容易维护。
+// emailPoolRecord 表示内存里的单条邮箱记录。
+// Why: HTTP 层既要返回外部需要的账号字段，也要维护租约状态与持久化元数据，因此统一收口成一个稳定结构更容易保证读写一致。
 type emailPoolRecord struct {
 	ID              int
 	Email           string
@@ -65,11 +93,11 @@ type emailPoolRecord struct {
 	SourceUpdatedAt string
 	CreatedAt       string
 	UpdatedAt       string
-	ExtraFieldsJSON string
+	ExtraFields     []string
 }
 
 // emailPoolPublicAccount 是对外暴露的邮箱池账号结构。
-// Why: 对外接口要保留来源服务的字段形状，避免当前 Go 客户端和其他脚本因为返回体变化而失配。
+// Why: 继续沿用历史响应字段形状，避免现有客户端和脚本因为服务端改成 txt 存储后发生接口不兼容。
 type emailPoolPublicAccount struct {
 	ID              int      `json:"id"`
 	Email           string   `json:"email"`
@@ -128,19 +156,13 @@ type emailPoolFileSignature struct {
 	Size      int64
 }
 
-type emailPoolScanner interface {
-	Scan(dest ...any) error
-}
-
-type emailPoolQueryer interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-// emailPoolStore 负责邮箱池状态的 SQLite 持久化。
-// Why: web_mail 的核心价值在于“租约状态机 + 文件同步”，把这部分收拢到存储层可以避免 HTTP 层掺杂数据库细节。
+// emailPoolStore 负责把 emails.txt 当作唯一数据库进行读写。
+// Why: 改成 txt 持久化后，正确性取决于“进程内互斥 + 文件锁 + 原子替换写入”三层同时生效，否则多请求并发时很容易把状态写乱。
 type emailPoolStore struct {
-	db      *sql.DB
-	writeMu sync.Mutex
+	path      string
+	mu        sync.Mutex
+	records   []emailPoolRecord
+	signature *emailPoolFileSignature
 }
 
 // upstreamMailClient 负责请求上游邮件接口拉取最新邮件。
@@ -157,6 +179,7 @@ type emailPoolService struct {
 	emailsFile          string
 	mailClient          *upstreamMailClient
 	leaseTimeoutSeconds int
+	logger              *log.Logger
 	syncMu              sync.Mutex
 	fileSignature       *emailPoolFileSignature
 	lastSyncResult      emailPoolSyncResult
@@ -166,9 +189,13 @@ type emailPoolService struct {
 }
 
 // runWebMailServer 启动当前仓库内置的 web_mail HTTP 服务。
-// Why: 用户要求独立模式启动，因此这里明确提供单独 server 入口，而不是把服务偷偷嵌进注册主流程。
+// Why: 现在直接把 emails.txt 当数据库，因此启动时先完成一次同步，确保服务能接受只有基础四列的旧文件格式。
 func runWebMailServer(parent context.Context, cfg config, logger *log.Logger) error {
-	store, err := newEmailPoolStore(cfg.webMailDBPath)
+	if cfg.webMailDBPath != "" {
+		logger.Printf("web_mail 已忽略历史参数 web-mail-db=%s，当前直接使用 %s 作为 txt 数据库", cfg.webMailDBPath, cfg.webMailEmailsFile)
+	}
+
+	store, err := newEmailPoolStore(cfg.webMailEmailsFile)
 	if err != nil {
 		return err
 	}
@@ -181,6 +208,7 @@ func runWebMailServer(parent context.Context, cfg config, logger *log.Logger) er
 		cfg.webMailEmailsFile,
 		newUpstreamMailClient(cfg.mailAPIBase, cfg.requestTimeout),
 		cfg.webMailLeaseTimeoutSeconds,
+		logger,
 	)
 
 	syncResult, err := service.ensureSynced(context.Background(), true)
@@ -216,14 +244,14 @@ func runWebMailServer(parent context.Context, cfg config, logger *log.Logger) er
 }
 
 // parseEmailPoolLine 解析 emails.txt 中的单行记录。
-// Why: 来源文件使用 ---- 分隔，且后续可能继续追加附加列，因此这里显式保留 extra_fields 防止信息丢失。
+// Why: 允许在基础四列后追加运行态后缀字段，既兼容历史纯账号文件，也支持当前 txt 数据库存储租约状态。
 func parseEmailPoolLine(line string) (*emailPoolLine, error) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return nil, nil
 	}
 
-	parts := strings.Split(trimmed, "----")
+	parts := strings.Split(trimmed, emailPoolFieldDelimiter)
 	if len(parts) < 4 {
 		return nil, fmt.Errorf("邮箱数据字段不足 4 列: %s", trimmed)
 	}
@@ -234,158 +262,432 @@ func parseEmailPoolLine(line string) (*emailPoolLine, error) {
 		ClientID:     strings.TrimSpace(parts[2]),
 		RefreshToken: strings.TrimSpace(parts[3]),
 	}
-	for _, field := range parts[4:] {
-		record.ExtraFields = append(record.ExtraFields, strings.TrimSpace(field))
+
+	for _, rawField := range parts[4:] {
+		field := strings.TrimSpace(rawField)
+		if field == "" {
+			continue
+		}
+
+		key, value, ok := parseEmailPoolMetadataField(field)
+		if !ok {
+			record.ExtraFields = append(record.ExtraFields, field)
+			continue
+		}
+
+		switch key {
+		case emailPoolMetadataLeaseToken:
+			record.LeaseToken = copyStringPointerFromValue(value)
+			record.HasLeaseToken = true
+		case emailPoolMetadataLeasedAt:
+			record.LeasedAt = copyStringPointerFromValue(value)
+			record.HasLeasedAt = true
+		case emailPoolMetadataUsedAt:
+			record.UsedAt = copyStringPointerFromValue(value)
+			record.HasUsedAt = true
+		case emailPoolMetadataStatus:
+			normalizedStatus, err := normalizeEmailPoolStatus(value)
+			if err != nil {
+				return nil, err
+			}
+			record.Status = normalizedStatus
+			record.HasStatus = true
+		case emailPoolLegacyMetadataID, emailPoolLegacyMetadataCreatedAt, emailPoolLegacyMetadataUpdatedAt, emailPoolLegacyMetadataSourceTime:
+			// Why: 兼容旧版 txt/SQLite 迁移残留字段，但新格式不再把这些内部字段写回文件。
+			continue
+		}
 	}
+
 	return record, nil
 }
 
-// newEmailPoolStore 初始化邮箱池 SQLite 数据库。
-// Why: 这里把目录创建、连接池和 PRAGMA 初始化一次性做完，避免后续每个调用点重复拼装数据库状态。
-func newEmailPoolStore(dbPath string) (*emailPoolStore, error) {
-	directory := filepath.Dir(dbPath)
+func parseEmailPoolMetadataField(field string) (string, string, bool) {
+	index := strings.Index(field, ":")
+	if index <= 0 {
+		return "", "", false
+	}
+
+	key := strings.TrimSpace(field[:index])
+	if _, ok := emailPoolManagedMetadataKeys[key]; !ok {
+		return "", "", false
+	}
+	return key, strings.TrimSpace(field[index+1:]), true
+}
+
+func normalizeEmailPoolStatus(status string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(status))
+	switch normalized {
+	case emailPoolStatusAvailable, emailPoolStatusLeased, emailPoolStatusUsed:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("邮箱状态仅支持 available/leased/used，当前值=%q", status)
+	}
+}
+
+// newEmailPoolStore 初始化 txt 版邮箱池存储。
+// Why: 统一在这里收口目录预创建和文件路径规范化，避免调用方到处重复处理路径细节。
+func newEmailPoolStore(path string) (*emailPoolStore, error) {
+	cleanPath := filepath.Clean(path)
+	directory := filepath.Dir(cleanPath)
 	if directory != "." && directory != "" {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			return nil, fmt.Errorf("创建 web_mail 数据目录失败: %w", err)
 		}
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("打开 web_mail 数据库失败: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	store := &emailPoolStore{db: db}
-	if err := store.initialize(); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return store, nil
+	return &emailPoolStore{
+		path: cleanPath,
+	}, nil
 }
 
-// Close 关闭 SQLite 连接池。
+// Close 为了兼容原调用点保留，txt 存储当前无需释放额外资源。
 func (store *emailPoolStore) Close() error {
-	return store.db.Close()
-}
-
-func (store *emailPoolStore) initialize() error {
-	statements := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA foreign_keys=ON",
-		`
-		CREATE TABLE IF NOT EXISTS email_accounts (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			email TEXT NOT NULL UNIQUE,
-			password TEXT NOT NULL,
-			client_id TEXT NOT NULL,
-			refresh_token TEXT NOT NULL,
-			status TEXT NOT NULL DEFAULT 'available',
-			lease_token TEXT,
-			leased_at TEXT,
-			used_at TEXT,
-			source_updated_at TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			extra_fields_json TEXT NOT NULL DEFAULT '[]'
-		)
-		`,
-		`
-		CREATE INDEX IF NOT EXISTS idx_email_accounts_status_id
-		ON email_accounts(status, id)
-		`,
-	}
-	for _, statement := range statements {
-		if _, err := store.db.Exec(statement); err != nil {
-			return fmt.Errorf("初始化 web_mail 数据库失败: %w", err)
-		}
-	}
 	return nil
 }
 
-func runEmailPoolWithRetry[T any](operation string, callback func() (T, error)) (T, error) {
-	var zero T
-	var lastErr error
-	for attempt := 1; attempt <= emailPoolBusyRetryCount; attempt++ {
-		result, err := callback()
-		if err == nil {
-			return result, nil
-		}
-		if !isSQLiteBusyError(err) {
-			return zero, err
-		}
-		lastErr = err
-		time.Sleep(time.Duration(attempt) * emailPoolBusyRetryDelay)
+func (store *emailPoolStore) withLockedFile(callback func() error) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	lockPath := store.path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("创建 web_mail 锁目录失败: %w", err)
 	}
-	return zero, fmt.Errorf("SQLite 并发繁忙，操作失败: %s: %w", operation, lastErr)
+
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("打开 web_mail 锁文件失败: %w", err)
+	}
+	defer func() {
+		_ = lockFile.Close()
+	}()
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("锁定 web_mail 文件失败: %w", err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	}()
+
+	return callback()
 }
 
-func isSQLiteBusyError(err error) bool {
-	lower := strings.ToLower(err.Error())
-	return strings.Contains(lower, "database is locked") ||
-		strings.Contains(lower, "database table is locked") ||
-		strings.Contains(lower, "sqlite_busy")
+// syncFromFile 把 emails.txt 同步到内存快照。
+// Why: 虽然 txt 已经是唯一数据库，但服务仍然要支持外部脚本手工编辑文件，因此请求前需要把外部改动安全吸收到内存状态中。
+func (store *emailPoolStore) syncFromFile(ctx context.Context, emailsFile string) (emailPoolSyncResult, error) {
+	_ = ctx
+
+	cleanPath := filepath.Clean(emailsFile)
+	if cleanPath != store.path {
+		return emailPoolSyncResult{}, fmt.Errorf("邮箱文件路径不匹配: want=%s got=%s", store.path, cleanPath)
+	}
+
+	result := emailPoolSyncResult{
+		File:     cleanPath,
+		SyncedAt: utcNowString(),
+	}
+
+	err := store.withLockedFile(func() error {
+		loaded, changedByNormalization, err := store.loadRecordsUnlocked(result.SyncedAt)
+		if err != nil {
+			return err
+		}
+
+		result.Inserted, result.Updated, result.Skipped = diffEmailPoolRecords(store.records, loaded)
+		store.records = loaded
+
+		signature, err := getEmailPoolFileSignature(store.path)
+		if err != nil {
+			return fmt.Errorf("读取邮箱源文件签名失败: %w", err)
+		}
+		store.signature = signature
+
+		if changedByNormalization {
+			if err := store.saveRecordsUnlocked(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return emailPoolSyncResult{}, err
+	}
+
+	return result, nil
 }
 
-func utcNowString() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+func (store *emailPoolStore) loadRecordsUnlocked(now string) ([]emailPoolRecord, bool, error) {
+	raw, err := os.ReadFile(store.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, fmt.Errorf("读取邮箱源文件失败: %w", err)
+		}
+		return nil, false, fmt.Errorf("读取邮箱源文件失败: %w", err)
+	}
+
+	previousByEmail := make(map[string]emailPoolRecord, len(store.records))
+	for _, record := range store.records {
+		previousByEmail[normalizeEmailPoolKey(record.Email)] = cloneEmailPoolRecord(record)
+	}
+
+	records := make([]emailPoolRecord, 0)
+	seenEmails := make(map[string]struct{})
+	usedIDs := make(map[int]string)
+	changedByNormalization := false
+
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		parsedLine, err := parseEmailPoolLine(rawLine)
+		if err != nil {
+			return nil, false, err
+		}
+		if parsedLine == nil {
+			continue
+		}
+
+		emailKey := normalizeEmailPoolKey(parsedLine.Email)
+		if _, exists := seenEmails[emailKey]; exists {
+			return nil, false, fmt.Errorf("邮箱文件中存在重复账号: %s", parsedLine.Email)
+		}
+		seenEmails[emailKey] = struct{}{}
+
+		var previous *emailPoolRecord
+		if existing, ok := previousByEmail[emailKey]; ok {
+			copied := existing
+			previous = &copied
+		}
+
+		record, normalized, err := buildEmailPoolRecord(*parsedLine, previous, now)
+		if err != nil {
+			return nil, false, err
+		}
+		if conflictEmail, exists := usedIDs[record.ID]; exists && conflictEmail != emailKey {
+			return nil, false, fmt.Errorf("邮箱账号 ID 冲突: %s 与 %s", parsedLine.Email, conflictEmail)
+		}
+		usedIDs[record.ID] = emailKey
+		if normalized {
+			changedByNormalization = true
+		}
+		records = append(records, record)
+	}
+
+	return records, changedByNormalization, nil
 }
 
-func nullableString(value sql.NullString) *string {
-	if !value.Valid {
+func buildEmailPoolRecord(line emailPoolLine, previous *emailPoolRecord, now string) (emailPoolRecord, bool, error) {
+	record := emailPoolRecord{
+		ID:           stableEmailPoolID(line.Email),
+		Email:        line.Email,
+		Password:     line.Password,
+		ClientID:     line.ClientID,
+		RefreshToken: line.RefreshToken,
+		ExtraFields:  append([]string(nil), line.ExtraFields...),
+	}
+	changed := false
+
+	if line.HasStatus {
+		record.Status = line.Status
+	} else if previous != nil {
+		record.Status = previous.Status
+	} else {
+		record.Status = emailPoolStatusAvailable
+		changed = true
+	}
+
+	if line.HasLeaseToken {
+		record.LeaseToken = cloneStringPointer(line.LeaseToken)
+	} else if previous != nil {
+		record.LeaseToken = cloneStringPointer(previous.LeaseToken)
+	}
+
+	if line.HasLeasedAt {
+		record.LeasedAt = cloneStringPointer(line.LeasedAt)
+	} else if previous != nil {
+		record.LeasedAt = cloneStringPointer(previous.LeasedAt)
+	}
+
+	if line.HasUsedAt {
+		record.UsedAt = cloneStringPointer(line.UsedAt)
+	} else if previous != nil {
+		record.UsedAt = cloneStringPointer(previous.UsedAt)
+	}
+	record.CreatedAt = ""
+	record.SourceUpdatedAt = ""
+	record.UpdatedAt = ""
+
+	if normalized, err := normalizeEmailPoolRecord(&record, now); err != nil {
+		return emailPoolRecord{}, false, err
+	} else if normalized {
+		changed = true
+	}
+
+	return record, changed, nil
+}
+
+func normalizeEmailPoolRecord(record *emailPoolRecord, now string) (bool, error) {
+	_ = now
+	changed := false
+
+	if record.Status == "" {
+		record.Status = emailPoolStatusAvailable
+		changed = true
+	}
+
+	normalizedStatus, err := normalizeEmailPoolStatus(record.Status)
+	if err != nil {
+		return false, err
+	}
+	if normalizedStatus != record.Status {
+		record.Status = normalizedStatus
+		changed = true
+	}
+
+	record.LeaseToken, changed = normalizeManagedPointer(record.LeaseToken, changed)
+	record.LeasedAt, changed = normalizeManagedPointer(record.LeasedAt, changed)
+	record.UsedAt, changed = normalizeManagedPointer(record.UsedAt, changed)
+
+	switch record.Status {
+	case emailPoolStatusAvailable:
+		if record.LeaseToken != nil {
+			record.LeaseToken = nil
+			changed = true
+		}
+		if record.LeasedAt != nil {
+			record.LeasedAt = nil
+			changed = true
+		}
+		if record.UsedAt != nil {
+			record.UsedAt = nil
+			changed = true
+		}
+	case emailPoolStatusLeased:
+		if record.LeaseToken == nil || record.LeasedAt == nil {
+			record.Status = emailPoolStatusAvailable
+			record.LeaseToken = nil
+			record.LeasedAt = nil
+			record.UsedAt = nil
+			changed = true
+		}
+	case emailPoolStatusUsed:
+		if record.LeaseToken != nil {
+			record.LeaseToken = nil
+			changed = true
+		}
+		if record.LeasedAt != nil {
+			record.LeasedAt = nil
+			changed = true
+		}
+	}
+
+	return changed, nil
+}
+
+func normalizeManagedPointer(value *string, changed bool) (*string, bool) {
+	if value == nil {
+		return nil, changed
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil, true
+	}
+	if trimmed == *value {
+		return value, changed
+	}
+	return &trimmed, true
+}
+
+func diffEmailPoolRecords(previous []emailPoolRecord, current []emailPoolRecord) (int, int, int) {
+	previousByEmail := make(map[string]emailPoolRecord, len(previous))
+	for _, record := range previous {
+		previousByEmail[normalizeEmailPoolKey(record.Email)] = cloneEmailPoolRecord(record)
+	}
+
+	inserted := 0
+	updated := 0
+	skipped := 0
+	for _, record := range current {
+		existing, ok := previousByEmail[normalizeEmailPoolKey(record.Email)]
+		if !ok {
+			inserted++
+			continue
+		}
+		if sameEmailPoolRecord(existing, record) {
+			skipped++
+			continue
+		}
+		updated++
+	}
+	return inserted, updated, skipped
+}
+
+func sameEmailPoolSourceFields(left emailPoolRecord, right emailPoolRecord) bool {
+	return left.Email == right.Email &&
+		left.Password == right.Password &&
+		left.ClientID == right.ClientID &&
+		left.RefreshToken == right.RefreshToken &&
+		sameStringSlice(left.ExtraFields, right.ExtraFields)
+}
+
+func sameEmailPoolRecord(left emailPoolRecord, right emailPoolRecord) bool {
+	return left.ID == right.ID &&
+		left.Email == right.Email &&
+		left.Password == right.Password &&
+		left.ClientID == right.ClientID &&
+		left.RefreshToken == right.RefreshToken &&
+		left.Status == right.Status &&
+		sameStringPointer(left.LeaseToken, right.LeaseToken) &&
+		sameStringPointer(left.LeasedAt, right.LeasedAt) &&
+		sameStringPointer(left.UsedAt, right.UsedAt) &&
+		sameStringSlice(left.ExtraFields, right.ExtraFields)
+}
+
+func sameStringPointer(left *string, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameStringSlice(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneEmailPoolRecord(record emailPoolRecord) emailPoolRecord {
+	record.ExtraFields = append([]string(nil), record.ExtraFields...)
+	record.LeaseToken = cloneStringPointer(record.LeaseToken)
+	record.LeasedAt = cloneStringPointer(record.LeasedAt)
+	record.UsedAt = cloneStringPointer(record.UsedAt)
+	return record
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
 		return nil
 	}
-	copied := value.String
+	copied := *value
 	return &copied
 }
 
-func scanEmailPoolRecord(scanner emailPoolScanner) (emailPoolRecord, error) {
-	record := emailPoolRecord{}
-	var leaseToken sql.NullString
-	var leasedAt sql.NullString
-	var usedAt sql.NullString
-	if err := scanner.Scan(
-		&record.ID,
-		&record.Email,
-		&record.Password,
-		&record.ClientID,
-		&record.RefreshToken,
-		&record.Status,
-		&leaseToken,
-		&leasedAt,
-		&usedAt,
-		&record.SourceUpdatedAt,
-		&record.CreatedAt,
-		&record.UpdatedAt,
-		&record.ExtraFieldsJSON,
-	); err != nil {
-		return emailPoolRecord{}, err
+func copyStringPointerFromValue(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
 	}
-	record.LeaseToken = nullableString(leaseToken)
-	record.LeasedAt = nullableString(leasedAt)
-	record.UsedAt = nullableString(usedAt)
-	return record, nil
+	return &trimmed
 }
 
-func fetchEmailPoolRecord(ctx context.Context, queryer emailPoolQueryer, query string, args ...any) (*emailPoolRecord, error) {
-	record, err := scanEmailPoolRecord(queryer.QueryRowContext(ctx, query, args...))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &record, nil
+func normalizeEmailPoolKey(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 func (record emailPoolRecord) publicAccount() emailPoolPublicAccount {
-	extraFields := []string{}
-	if record.ExtraFieldsJSON != "" {
-		_ = json.Unmarshal([]byte(record.ExtraFieldsJSON), &extraFields)
-	}
 	return emailPoolPublicAccount{
 		ID:              record.ID,
 		Email:           record.Email,
@@ -393,409 +695,363 @@ func (record emailPoolRecord) publicAccount() emailPoolPublicAccount {
 		ClientID:        record.ClientID,
 		RefreshToken:    record.RefreshToken,
 		Status:          record.Status,
-		LeaseToken:      record.LeaseToken,
-		LeasedAt:        record.LeasedAt,
-		UsedAt:          record.UsedAt,
+		LeaseToken:      cloneStringPointer(record.LeaseToken),
+		LeasedAt:        cloneStringPointer(record.LeasedAt),
+		UsedAt:          cloneStringPointer(record.UsedAt),
 		SourceUpdatedAt: record.SourceUpdatedAt,
 		CreatedAt:       record.CreatedAt,
 		UpdatedAt:       record.UpdatedAt,
-		ExtraFields:     extraFields,
+		ExtraFields:     append([]string(nil), record.ExtraFields...),
 	}
 }
 
-// syncFromFile 把 emails.txt 中的邮箱数据同步到 SQLite。
-// Why: 这里按 email 做增量同步而不是全量覆盖，是为了保留租约状态和历史 used 痕迹，避免文件覆盖把运行状态清空。
-func (store *emailPoolStore) syncFromFile(ctx context.Context, emailsFile string) (emailPoolSyncResult, error) {
-	lines, err := os.ReadFile(emailsFile)
+func (store *emailPoolStore) saveRecordsUnlocked() error {
+	if err := os.MkdirAll(filepath.Dir(store.path), 0o755); err != nil {
+		return fmt.Errorf("创建 web_mail 数据目录失败: %w", err)
+	}
+
+	builder := strings.Builder{}
+	for _, record := range store.records {
+		builder.WriteString(serializeEmailPoolRecord(record))
+		builder.WriteByte('\n')
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(store.path), filepath.Base(store.path)+".*.tmp")
 	if err != nil {
-		return emailPoolSyncResult{}, fmt.Errorf("读取邮箱源文件失败: %w", err)
+		return fmt.Errorf("创建 web_mail 临时文件失败: %w", err)
+	}
+	tempPath := tempFile.Name()
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := tempFile.WriteString(builder.String()); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("写入 web_mail 临时文件失败: %w", err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("关闭 web_mail 临时文件失败: %w", err)
+	}
+	if err := os.Rename(tempPath, store.path); err != nil {
+		return fmt.Errorf("替换 web_mail 文件失败: %w", err)
 	}
 
-	parsedLines := make([]emailPoolLine, 0)
-	for _, line := range strings.Split(string(lines), "\n") {
-		parsed, err := parseEmailPoolLine(line)
-		if err != nil {
-			return emailPoolSyncResult{}, err
-		}
-		if parsed == nil {
-			continue
-		}
-		parsedLines = append(parsedLines, *parsed)
+	signature, err := getEmailPoolFileSignature(store.path)
+	if err != nil {
+		return fmt.Errorf("读取邮箱源文件签名失败: %w", err)
+	}
+	store.signature = signature
+	return nil
+}
+
+func serializeEmailPoolRecord(record emailPoolRecord) string {
+	fields := []string{
+		record.Email,
+		record.Password,
+		record.ClientID,
+		record.RefreshToken,
+	}
+	fields = append(fields, record.ExtraFields...)
+	if record.LeaseToken != nil {
+		fields = append(fields, emailPoolMetadataLeaseToken+":"+*record.LeaseToken)
+	}
+	if record.LeasedAt != nil {
+		fields = append(fields, emailPoolMetadataLeasedAt+":"+*record.LeasedAt)
+	}
+	if record.UsedAt != nil {
+		fields = append(fields, emailPoolMetadataUsedAt+":"+*record.UsedAt)
+	}
+	if record.Status != "" && record.Status != emailPoolStatusAvailable {
+		fields = append(fields, emailPoolMetadataStatus+":"+record.Status)
+	}
+	return strings.Join(fields, emailPoolFieldDelimiter)
+}
+
+func (store *emailPoolStore) reloadIfChangedUnlocked(now string) error {
+	currentSignature, err := getEmailPoolFileSignature(store.path)
+	if err != nil {
+		return fmt.Errorf("读取邮箱源文件签名失败: %w", err)
+	}
+	if sameEmailPoolFileSignature(store.signature, currentSignature) {
+		return nil
 	}
 
-	return runEmailPoolWithRetry("sync_from_file", func() (emailPoolSyncResult, error) {
-		store.writeMu.Lock()
-		defer store.writeMu.Unlock()
-
-		tx, err := store.db.BeginTx(ctx, nil)
-		if err != nil {
-			return emailPoolSyncResult{}, err
+	loaded, changedByNormalization, err := store.loadRecordsUnlocked(now)
+	if err != nil {
+		return err
+	}
+	store.records = loaded
+	store.signature = currentSignature
+	if changedByNormalization {
+		if err := store.saveRecordsUnlocked(); err != nil {
+			return err
 		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
+	}
+	return nil
+}
 
-		result := emailPoolSyncResult{
-			File:     emailsFile,
-			SyncedAt: utcNowString(),
-		}
-		for _, parsed := range parsedLines {
-			current, err := fetchEmailPoolRecord(
-				ctx,
-				tx,
-				"SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE email = ?",
-				parsed.Email,
-			)
-			if err != nil {
-				return emailPoolSyncResult{}, err
-			}
-
-			extraFieldsJSON, err := json.Marshal(parsed.ExtraFields)
-			if err != nil {
-				return emailPoolSyncResult{}, fmt.Errorf("序列化 extra_fields 失败: %w", err)
-			}
-
-			if current == nil {
-				_, err = tx.ExecContext(
-					ctx,
-					`
-					INSERT INTO email_accounts (
-						email, password, client_id, refresh_token, status,
-						source_updated_at, created_at, updated_at, extra_fields_json
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-					`,
-					parsed.Email,
-					parsed.Password,
-					parsed.ClientID,
-					parsed.RefreshToken,
-					emailPoolStatusAvailable,
-					result.SyncedAt,
-					result.SyncedAt,
-					result.SyncedAt,
-					string(extraFieldsJSON),
-				)
-				if err != nil {
-					return emailPoolSyncResult{}, err
-				}
-				result.Inserted++
-				continue
-			}
-
-			if current.Password == parsed.Password &&
-				current.ClientID == parsed.ClientID &&
-				current.RefreshToken == parsed.RefreshToken &&
-				current.ExtraFieldsJSON == string(extraFieldsJSON) {
-				if _, err := tx.ExecContext(
-					ctx,
-					"UPDATE email_accounts SET source_updated_at = ? WHERE email = ?",
-					result.SyncedAt,
-					parsed.Email,
-				); err != nil {
-					return emailPoolSyncResult{}, err
-				}
-				result.Skipped++
-				continue
-			}
-
-			if _, err := tx.ExecContext(
-				ctx,
-				`
-				UPDATE email_accounts
-				SET password = ?, client_id = ?, refresh_token = ?, source_updated_at = ?, updated_at = ?, extra_fields_json = ?
-				WHERE email = ?
-				`,
-				parsed.Password,
-				parsed.ClientID,
-				parsed.RefreshToken,
-				result.SyncedAt,
-				result.SyncedAt,
-				string(extraFieldsJSON),
-				parsed.Email,
-			); err != nil {
-				return emailPoolSyncResult{}, err
-			}
-			result.Updated++
-		}
-
-		if err := tx.Commit(); err != nil {
-			return emailPoolSyncResult{}, err
-		}
-		return result, nil
-	})
+func stableEmailPoolID(email string) int {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(normalizeEmailPoolKey(email)))
+	value := int(hasher.Sum32() & 0x7fffffff)
+	if value == 0 {
+		return 1
+	}
+	return value
 }
 
 // getStats 返回邮箱池状态统计。
 func (store *emailPoolStore) getStats(ctx context.Context) (emailPoolStats, error) {
-	return runEmailPoolWithRetry("get_stats", func() (emailPoolStats, error) {
-		rows, err := store.db.QueryContext(ctx, "SELECT status, COUNT(*) FROM email_accounts GROUP BY status")
-		if err != nil {
-			return emailPoolStats{}, err
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
+	_ = ctx
 
-		stats := emailPoolStats{}
-		for rows.Next() {
-			var status string
-			var count int
-			if err := rows.Scan(&status, &count); err != nil {
-				return emailPoolStats{}, err
-			}
-			stats.Total += count
-			switch status {
-			case emailPoolStatusAvailable:
-				stats.Available = count
-			case emailPoolStatusLeased:
-				stats.Leased = count
-			case emailPoolStatusUsed:
-				stats.Used = count
-			}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	stats := emailPoolStats{}
+	for _, record := range store.records {
+		stats.Total++
+		switch record.Status {
+		case emailPoolStatusAvailable:
+			stats.Available++
+		case emailPoolStatusLeased:
+			stats.Leased++
+		case emailPoolStatusUsed:
+			stats.Used++
 		}
-		return stats, rows.Err()
-	})
+	}
+	return stats, nil
 }
 
 // leaseOne 原子租出一个可用邮箱账号。
-// Why: 注册线程会并发取号，必须把“查询可用账号”和“标记已租出”放在同一事务内完成，避免重复租出同一邮箱。
+// Why: 请求会并发命中 lease 接口，因此必须把“读最新文件状态 + 选中可用账号 + 回写租约”放进同一临界区，避免重复租出同一条记录。
 func (store *emailPoolStore) leaseOne(ctx context.Context) (*emailPoolRecord, error) {
-	return runEmailPoolWithRetry("lease_one", func() (*emailPoolRecord, error) {
-		store.writeMu.Lock()
-		defer store.writeMu.Unlock()
+	_ = ctx
 
-		tx, err := store.db.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
+	var leasedRecord *emailPoolRecord
+	err := store.withLockedFile(func() error {
+		now := utcNowString()
+		if err := store.reloadIfChangedUnlocked(now); err != nil {
+			return err
 		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
 
-		record, err := fetchEmailPoolRecord(
-			ctx,
-			tx,
-			"SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE status = ? ORDER BY id ASC LIMIT 1",
-			emailPoolStatusAvailable,
-		)
-		if err != nil || record == nil {
-			return record, err
+		index := -1
+		for currentIndex := range store.records {
+			if store.records[currentIndex].Status != emailPoolStatusAvailable {
+				continue
+			}
+			if index == -1 || store.records[currentIndex].ID < store.records[index].ID {
+				index = currentIndex
+			}
+		}
+		if index < 0 {
+			return nil
 		}
 
 		leaseToken, err := newLeaseToken()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		now := utcNowString()
-		if _, err := tx.ExecContext(
-			ctx,
-			"UPDATE email_accounts SET status = ?, lease_token = ?, leased_at = ?, updated_at = ? WHERE id = ?",
-			emailPoolStatusLeased,
-			leaseToken,
-			now,
-			now,
-			record.ID,
-		); err != nil {
-			return nil, err
-		}
+		record := &store.records[index]
+		record.Status = emailPoolStatusLeased
+		record.LeaseToken = &leaseToken
+		record.LeasedAt = &now
+		record.UsedAt = nil
+		record.UpdatedAt = now
 
-		updated, err := fetchEmailPoolRecord(ctx, tx, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", record.ID)
-		if err != nil {
-			return nil, err
+		if err := store.saveRecordsUnlocked(); err != nil {
+			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return updated, nil
+		copied := cloneEmailPoolRecord(*record)
+		leasedRecord = &copied
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return leasedRecord, nil
 }
 
 // getAccount 按 ID 查询邮箱记录。
 func (store *emailPoolStore) getAccount(ctx context.Context, accountID int) (*emailPoolRecord, error) {
-	return runEmailPoolWithRetry("get_account", func() (*emailPoolRecord, error) {
-		return fetchEmailPoolRecord(ctx, store.db, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", accountID)
-	})
+	_ = ctx
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	for _, record := range store.records {
+		if record.ID != accountID {
+			continue
+		}
+		copied := cloneEmailPoolRecord(record)
+		return &copied, nil
+	}
+	return nil, nil
 }
 
 // getAccountByEmail 按邮箱地址查询记录。
 func (store *emailPoolStore) getAccountByEmail(ctx context.Context, email string) (*emailPoolRecord, error) {
-	return runEmailPoolWithRetry("get_account_by_email", func() (*emailPoolRecord, error) {
-		return fetchEmailPoolRecord(ctx, store.db, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE email = ?", email)
-	})
+	_ = ctx
+
+	target := normalizeEmailPoolKey(email)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	for _, record := range store.records {
+		if normalizeEmailPoolKey(record.Email) != target {
+			continue
+		}
+		copied := cloneEmailPoolRecord(record)
+		return &copied, nil
+	}
+	return nil, nil
 }
 
 // markUsed 把租出的邮箱标记为已使用。
 // Why: 注册成功后必须把邮箱永久移出可用池，否则后续流程会重复租到已经消费过的邮箱。
 func (store *emailPoolStore) markUsed(ctx context.Context, accountID int, leaseToken string) (*emailPoolRecord, error) {
-	return runEmailPoolWithRetry("mark_used", func() (*emailPoolRecord, error) {
-		store.writeMu.Lock()
-		defer store.writeMu.Unlock()
+	_ = ctx
 
-		tx, err := store.db.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
+	var updatedRecord *emailPoolRecord
+	err := store.withLockedFile(func() error {
+		now := utcNowString()
+		if err := store.reloadIfChangedUnlocked(now); err != nil {
+			return err
 		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
 
-		record, err := fetchEmailPoolRecord(ctx, tx, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", accountID)
-		if err != nil || record == nil {
-			return record, err
+		index := findEmailPoolRecordIndexByID(store.records, accountID)
+		if index < 0 {
+			return nil
 		}
+
+		record := &store.records[index]
 		if record.Status != emailPoolStatusLeased {
-			return nil, fmt.Errorf("当前状态为 %s，不能标记为已使用", record.Status)
+			return fmt.Errorf("当前状态为 %s，不能标记为已使用", record.Status)
 		}
 		if record.LeaseToken == nil || *record.LeaseToken != leaseToken {
-			return nil, errors.New("lease_token 不匹配，不能标记为已使用")
+			return errors.New("lease_token 不匹配，不能标记为已使用")
 		}
 
-		now := utcNowString()
-		if _, err := tx.ExecContext(
-			ctx,
-			"UPDATE email_accounts SET status = ?, used_at = ?, lease_token = NULL, leased_at = NULL, updated_at = ? WHERE id = ?",
-			emailPoolStatusUsed,
-			now,
-			now,
-			accountID,
-		); err != nil {
-			return nil, err
-		}
+		record.Status = emailPoolStatusUsed
+		record.UsedAt = &now
+		record.LeaseToken = nil
+		record.LeasedAt = nil
+		record.UpdatedAt = now
 
-		updated, err := fetchEmailPoolRecord(ctx, tx, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", accountID)
-		if err != nil {
-			return nil, err
+		if err := store.saveRecordsUnlocked(); err != nil {
+			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return updated, nil
+		copied := cloneEmailPoolRecord(*record)
+		updatedRecord = &copied
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return updatedRecord, nil
 }
 
 // returnToPool 把租出的邮箱归还到账号池。
 // Why: 注册失败后及时归还邮箱，才能让后续 worker 继续消费这批尚未成功注册的地址。
 func (store *emailPoolStore) returnToPool(ctx context.Context, accountID int, leaseToken string) (*emailPoolRecord, error) {
-	return runEmailPoolWithRetry("return_to_pool", func() (*emailPoolRecord, error) {
-		store.writeMu.Lock()
-		defer store.writeMu.Unlock()
+	_ = ctx
 
-		tx, err := store.db.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
+	var updatedRecord *emailPoolRecord
+	err := store.withLockedFile(func() error {
+		now := utcNowString()
+		if err := store.reloadIfChangedUnlocked(now); err != nil {
+			return err
 		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
 
-		record, err := fetchEmailPoolRecord(ctx, tx, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", accountID)
-		if err != nil || record == nil {
-			return record, err
+		index := findEmailPoolRecordIndexByID(store.records, accountID)
+		if index < 0 {
+			return nil
 		}
+
+		record := &store.records[index]
 		if record.Status != emailPoolStatusLeased {
-			return nil, fmt.Errorf("当前状态为 %s，不能归还", record.Status)
+			return fmt.Errorf("当前状态为 %s，不能归还", record.Status)
 		}
 		if record.LeaseToken == nil || *record.LeaseToken != leaseToken {
-			return nil, errors.New("lease_token 不匹配，不能归还")
+			return errors.New("lease_token 不匹配，不能归还")
 		}
 
-		now := utcNowString()
-		if _, err := tx.ExecContext(
-			ctx,
-			"UPDATE email_accounts SET status = ?, lease_token = NULL, leased_at = NULL, updated_at = ? WHERE id = ?",
-			emailPoolStatusAvailable,
-			now,
-			accountID,
-		); err != nil {
-			return nil, err
-		}
+		record.Status = emailPoolStatusAvailable
+		record.LeaseToken = nil
+		record.LeasedAt = nil
+		record.UsedAt = nil
+		record.UpdatedAt = now
 
-		updated, err := fetchEmailPoolRecord(ctx, tx, "SELECT "+emailPoolSelectColumns+" FROM email_accounts WHERE id = ?", accountID)
-		if err != nil {
-			return nil, err
+		if err := store.saveRecordsUnlocked(); err != nil {
+			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return updated, nil
+		copied := cloneEmailPoolRecord(*record)
+		updatedRecord = &copied
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return updatedRecord, nil
+}
+
+func findEmailPoolRecordIndexByID(records []emailPoolRecord, accountID int) int {
+	for index := range records {
+		if records[index].ID == accountID {
+			return index
+		}
+	}
+	return -1
 }
 
 // reclaimExpiredLeases 回收超时未确认的租约。
 // Why: 调用方崩溃后邮箱可能长期卡在 leased 状态，自动回收是避免账号池被占死的关键兜底机制。
 func (store *emailPoolStore) reclaimExpiredLeases(ctx context.Context, leaseTimeoutSeconds int) (emailPoolReclaimResult, error) {
-	return runEmailPoolWithRetry("reclaim_expired_leases", func() (emailPoolReclaimResult, error) {
-		store.writeMu.Lock()
-		defer store.writeMu.Unlock()
+	_ = ctx
 
-		tx, err := store.db.BeginTx(ctx, nil)
-		if err != nil {
-			return emailPoolReclaimResult{}, err
-		}
-		defer func() {
-			_ = tx.Rollback()
-		}()
+	result := emailPoolReclaimResult{
+		ReclaimedIDs:        []int{},
+		CheckedAt:           utcNowString(),
+		LeaseTimeoutSeconds: leaseTimeoutSeconds,
+	}
 
-		now := time.Now().UTC()
-		expireBefore := now.Add(-time.Duration(leaseTimeoutSeconds) * time.Second)
-		rows, err := tx.QueryContext(
-			ctx,
-			"SELECT id, leased_at FROM email_accounts WHERE status = ? AND leased_at IS NOT NULL ORDER BY id ASC",
-			emailPoolStatusLeased,
-		)
-		if err != nil {
-			return emailPoolReclaimResult{}, err
+	err := store.withLockedFile(func() error {
+		if err := store.reloadIfChangedUnlocked(result.CheckedAt); err != nil {
+			return err
 		}
-		defer func() {
-			_ = rows.Close()
-		}()
 
-		result := emailPoolReclaimResult{
-			ReclaimedIDs:        []int{},
-			CheckedAt:           now.Format(time.RFC3339Nano),
-			LeaseTimeoutSeconds: leaseTimeoutSeconds,
-		}
-		for rows.Next() {
-			var accountID int
-			var leasedAtRaw string
-			if err := rows.Scan(&accountID, &leasedAtRaw); err != nil {
-				return emailPoolReclaimResult{}, err
+		expireBefore := time.Now().UTC().Add(-time.Duration(leaseTimeoutSeconds) * time.Second)
+		changed := false
+		for index := range store.records {
+			record := &store.records[index]
+			if record.Status != emailPoolStatusLeased || record.LeasedAt == nil {
+				continue
 			}
 
-			leasedAt, err := time.Parse(time.RFC3339Nano, leasedAtRaw)
+			leasedAt, err := time.Parse(time.RFC3339Nano, *record.LeasedAt)
 			if err != nil || leasedAt.After(expireBefore) {
 				continue
 			}
 
-			updateResult, err := tx.ExecContext(
-				ctx,
-				"UPDATE email_accounts SET status = ?, lease_token = NULL, leased_at = NULL, updated_at = ? WHERE id = ? AND status = ?",
-				emailPoolStatusAvailable,
-				result.CheckedAt,
-				accountID,
-				emailPoolStatusLeased,
-			)
-			if err != nil {
-				return emailPoolReclaimResult{}, err
-			}
+			record.Status = emailPoolStatusAvailable
+			record.LeaseToken = nil
+			record.LeasedAt = nil
+			record.UsedAt = nil
+			record.UpdatedAt = result.CheckedAt
+			result.ReclaimedIDs = append(result.ReclaimedIDs, record.ID)
+			changed = true
+		}
 
-			affected, err := updateResult.RowsAffected()
-			if err != nil {
-				return emailPoolReclaimResult{}, err
-			}
-			if affected > 0 {
-				result.ReclaimedIDs = append(result.ReclaimedIDs, accountID)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			return emailPoolReclaimResult{}, err
-		}
 		result.ReclaimedCount = len(result.ReclaimedIDs)
-
-		if err := tx.Commit(); err != nil {
-			return emailPoolReclaimResult{}, err
+		if !changed {
+			return nil
 		}
-		return result, nil
+		return store.saveRecordsUnlocked()
 	})
+	if err != nil {
+		return emailPoolReclaimResult{}, err
+	}
+
+	return result, nil
 }
 
 // newUpstreamMailClient 创建上游邮件接口客户端。
@@ -866,12 +1122,17 @@ func truncateForLog(payload []byte, limit int) string {
 }
 
 // newEmailPoolService 构造带自动同步和租约回收缓存的服务实例。
-func newEmailPoolService(store *emailPoolStore, emailsFile string, mailClient *upstreamMailClient, leaseTimeoutSeconds int) *emailPoolService {
+func newEmailPoolService(store *emailPoolStore, emailsFile string, mailClient *upstreamMailClient, leaseTimeoutSeconds int, logger *log.Logger) *emailPoolService {
+	// Why: 单测和局部复用场景不一定会显式注入 logger，这里统一兜底到 discard，避免关键日志调用散落空指针判断。
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
 	return &emailPoolService{
 		store:               store,
 		emailsFile:          emailsFile,
 		mailClient:          mailClient,
 		leaseTimeoutSeconds: leaseTimeoutSeconds,
+		logger:              logger,
 	}
 }
 
@@ -894,7 +1155,7 @@ func sameEmailPoolFileSignature(left *emailPoolFileSignature, right *emailPoolFi
 }
 
 // ensureSynced 在请求前按需执行 emails.txt 自动同步。
-// Why: 账号池文件可能被外部脚本持续追加，因此服务端必须在处理请求前懒同步，避免长驻进程拿到过期数据。
+// Why: 邮箱文件可能被外部脚本持续追加或人工编辑，因此服务端必须在处理请求前懒同步，避免长驻进程拿到过期数据。
 func (service *emailPoolService) ensureSynced(ctx context.Context, force bool) (emailPoolSyncResult, error) {
 	currentSignature, err := getEmailPoolFileSignature(service.emailsFile)
 	if err != nil {
@@ -934,13 +1195,18 @@ func (service *emailPoolService) ensureSynced(ctx context.Context, force bool) (
 	if err != nil {
 		return emailPoolSyncResult{}, err
 	}
-	service.fileSignature = currentSignature
+
+	latestSignature, err := getEmailPoolFileSignature(service.emailsFile)
+	if err != nil {
+		return emailPoolSyncResult{}, fmt.Errorf("读取邮箱源文件签名失败: %w", err)
+	}
+	service.fileSignature = latestSignature
 	service.lastSyncResult = result
 	return result, nil
 }
 
 // ensureReclaimed 以最小检查间隔执行租约回收。
-// Why: 高频请求下每次都扫描 leased 记录会放大数据库压力，因此这里显式做节流。
+// Why: 高频请求下每次都扫描 leased 记录会放大文件 IO，因此这里显式做节流。
 func (service *emailPoolService) ensureReclaimed(ctx context.Context, force bool) (emailPoolReclaimResult, error) {
 	if !force && !service.lastReclaimCheckAt.IsZero() && time.Since(service.lastReclaimCheckAt) < emailPoolReclaimCheckInterval {
 		return service.lastReclaimResult, nil
@@ -956,6 +1222,9 @@ func (service *emailPoolService) ensureReclaimed(ctx context.Context, force bool
 	result, err := service.store.reclaimExpiredLeases(ctx, service.leaseTimeoutSeconds)
 	if err != nil {
 		return emailPoolReclaimResult{}, err
+	}
+	if result.ReclaimedCount > 0 {
+		service.logf("web_mail 已回收超时租约: reclaimed=%d ids=%v lease_timeout_seconds=%d", result.ReclaimedCount, result.ReclaimedIDs, result.LeaseTimeoutSeconds)
 	}
 	service.lastReclaimResult = result
 	service.lastReclaimCheckAt = time.Now()
@@ -995,7 +1264,7 @@ func (service *emailPoolService) handleGet(writer http.ResponseWriter, request *
 	}
 
 	if err := service.prepareRequestData(request.Context()); err != nil {
-		service.respondUnexpected(writer, err)
+		service.respondUnexpected(writer, request, err)
 		return
 	}
 
@@ -1003,7 +1272,7 @@ func (service *emailPoolService) handleGet(writer http.ResponseWriter, request *
 	case path == "/api/email-pool/stats":
 		stats, err := service.store.getStats(request.Context())
 		if err != nil {
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 		service.respondEnvelope(writer, http.StatusOK, stats)
@@ -1014,6 +1283,7 @@ func (service *emailPoolService) handleGet(writer http.ResponseWriter, request *
 	case strings.HasPrefix(path, "/api/email-pool/accounts/") && strings.HasSuffix(path, "/latest"):
 		accountID, err := extractEmailPoolAccountID(path, "/latest")
 		if err != nil {
+			service.logRequestFailure(request, http.StatusBadRequest, "latest 查询失败: 非法账号 ID")
 			service.respondError(writer, http.StatusBadRequest, "账号 ID 非法")
 			return
 		}
@@ -1028,13 +1298,14 @@ func (service *emailPoolService) handlePost(writer http.ResponseWriter, request 
 	path := normalizeEmailPoolPath(request.URL.Path)
 	payload, err := readOptionalJSONBody(request.Body)
 	if err != nil {
+		service.logRequestFailure(request, http.StatusBadRequest, "请求体不是合法 JSON")
 		service.respondError(writer, http.StatusBadRequest, "请求体不是合法 JSON")
 		return
 	}
 
 	if path != "/api/email-pool/sync" {
 		if err := service.prepareRequestData(request.Context()); err != nil {
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 	}
@@ -1043,14 +1314,22 @@ func (service *emailPoolService) handlePost(writer http.ResponseWriter, request 
 	case path == "/api/email-pool/sync":
 		syncResult, err := service.ensureSynced(request.Context(), true)
 		if err != nil {
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 		reclaimResult, err := service.ensureReclaimed(request.Context(), true)
 		if err != nil {
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
+		service.logf(
+			"web_mail 手动同步完成: inserted=%d updated=%d skipped=%d reclaimed=%d file=%s",
+			syncResult.Inserted,
+			syncResult.Updated,
+			syncResult.Skipped,
+			reclaimResult.ReclaimedCount,
+			syncResult.File,
+		)
 		service.respondEnvelope(writer, http.StatusOK, emailPoolSyncEnvelopeData{
 			Sync:    syncResult,
 			Reclaim: reclaimResult,
@@ -1058,13 +1337,15 @@ func (service *emailPoolService) handlePost(writer http.ResponseWriter, request 
 	case path == "/api/email-pool/lease":
 		record, err := service.store.leaseOne(request.Context())
 		if err != nil {
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 		if record == nil {
+			service.logRequestFailure(request, http.StatusNotFound, "租号失败: 当前没有可用邮箱账号")
 			service.respondError(writer, http.StatusNotFound, "当前没有可用邮箱账号")
 			return
 		}
+		service.logRequestSuccess(request, "租出邮箱 account_id=%d email=%s", record.ID, record.Email)
 		service.respondEnvelope(writer, http.StatusOK, record.publicAccount())
 	case path == "/api/email-pool/accounts/by-email/latest":
 		email := strings.TrimSpace(fmt.Sprintf("%v", payload["email"]))
@@ -1073,56 +1354,67 @@ func (service *emailPoolService) handlePost(writer http.ResponseWriter, request 
 	case strings.HasPrefix(path, "/api/email-pool/accounts/") && strings.HasSuffix(path, "/mark-used"):
 		accountID, err := extractEmailPoolAccountID(path, "/mark-used")
 		if err != nil {
+			service.logRequestFailure(request, http.StatusBadRequest, "标记已使用失败: 非法账号 ID")
 			service.respondError(writer, http.StatusBadRequest, "账号 ID 非法")
 			return
 		}
 		leaseToken := strings.TrimSpace(fmt.Sprintf("%v", payload["lease_token"]))
 		if leaseToken == "" {
+			service.logRequestFailure(request, http.StatusBadRequest, "标记已使用失败: account_id=%d lease_token 缺失", accountID)
 			service.respondError(writer, http.StatusBadRequest, "lease_token 必填")
 			return
 		}
 		record, err := service.store.markUsed(request.Context(), accountID, leaseToken)
 		if err != nil {
 			if isLeaseConflict(err) {
+				service.logRequestFailure(request, http.StatusConflict, "标记已使用冲突: account_id=%d err=%v", accountID, err)
 				service.respondError(writer, http.StatusConflict, err.Error())
 				return
 			}
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 		if record == nil {
+			service.logRequestFailure(request, http.StatusNotFound, "标记已使用失败: account_id=%d 不存在", accountID)
 			service.respondError(writer, http.StatusNotFound, "账号不存在")
 			return
 		}
+		service.logRequestSuccess(request, "标记邮箱已使用: account_id=%d email=%s", record.ID, record.Email)
 		service.respondEnvelope(writer, http.StatusOK, record.publicAccount())
 	case strings.HasPrefix(path, "/api/email-pool/accounts/") && strings.HasSuffix(path, "/return"):
 		accountID, err := extractEmailPoolAccountID(path, "/return")
 		if err != nil {
+			service.logRequestFailure(request, http.StatusBadRequest, "归还邮箱失败: 非法账号 ID")
 			service.respondError(writer, http.StatusBadRequest, "账号 ID 非法")
 			return
 		}
 		leaseToken := strings.TrimSpace(fmt.Sprintf("%v", payload["lease_token"]))
 		if leaseToken == "" {
+			service.logRequestFailure(request, http.StatusBadRequest, "归还邮箱失败: account_id=%d lease_token 缺失", accountID)
 			service.respondError(writer, http.StatusBadRequest, "lease_token 必填")
 			return
 		}
 		record, err := service.store.returnToPool(request.Context(), accountID, leaseToken)
 		if err != nil {
 			if isLeaseConflict(err) {
+				service.logRequestFailure(request, http.StatusConflict, "归还邮箱冲突: account_id=%d err=%v", accountID, err)
 				service.respondError(writer, http.StatusConflict, err.Error())
 				return
 			}
-			service.respondUnexpected(writer, err)
+			service.respondUnexpected(writer, request, err)
 			return
 		}
 		if record == nil {
+			service.logRequestFailure(request, http.StatusNotFound, "归还邮箱失败: account_id=%d 不存在", accountID)
 			service.respondError(writer, http.StatusNotFound, "账号不存在")
 			return
 		}
+		service.logRequestSuccess(request, "归还邮箱成功: account_id=%d email=%s", record.ID, record.Email)
 		service.respondEnvelope(writer, http.StatusOK, record.publicAccount())
 	case strings.HasPrefix(path, "/api/email-pool/accounts/") && strings.HasSuffix(path, "/latest"):
 		accountID, err := extractEmailPoolAccountID(path, "/latest")
 		if err != nil {
+			service.logRequestFailure(request, http.StatusBadRequest, "latest 查询失败: 非法账号 ID")
 			service.respondError(writer, http.StatusBadRequest, "账号 ID 非法")
 			return
 		}
@@ -1187,25 +1479,29 @@ func normalizeEmailPoolMailbox(mailbox string) (string, error) {
 func (service *emailPoolService) handleLatestMailByID(writer http.ResponseWriter, request *http.Request, accountID int, mailbox string) {
 	normalizedMailbox, err := normalizeEmailPoolMailbox(mailbox)
 	if err != nil {
+		service.logRequestFailure(request, http.StatusBadRequest, "获取最新邮件失败: account_id=%d mailbox=%q err=%v", accountID, mailbox, err)
 		service.respondError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	record, err := service.store.getAccount(request.Context(), accountID)
 	if err != nil {
-		service.respondUnexpected(writer, err)
+		service.respondUnexpected(writer, request, err)
 		return
 	}
 	if record == nil {
+		service.logRequestFailure(request, http.StatusNotFound, "获取最新邮件失败: account_id=%d 不存在", accountID)
 		service.respondError(writer, http.StatusNotFound, "账号不存在")
 		return
 	}
 
 	latestMail, err := service.mailClient.fetchLatestMail(request.Context(), *record, normalizedMailbox)
 	if err != nil {
+		service.logRequestFailure(request, http.StatusBadGateway, "获取最新邮件失败: account_id=%d email=%s mailbox=%s err=%v", accountID, record.Email, normalizedMailbox, err)
 		service.respondError(writer, http.StatusBadGateway, err.Error())
 		return
 	}
+	service.logRequestSuccess(request, "获取最新邮件成功: account_id=%d email=%s mailbox=%s", record.ID, record.Email, normalizedMailbox)
 	service.respondEnvelope(writer, http.StatusOK, map[string]any{
 		"account":     record.publicAccount(),
 		"mailbox":     normalizedMailbox,
@@ -1215,31 +1511,36 @@ func (service *emailPoolService) handleLatestMailByID(writer http.ResponseWriter
 
 func (service *emailPoolService) handleLatestMailByEmail(writer http.ResponseWriter, request *http.Request, email string, mailbox string) {
 	if email == "" {
+		service.logRequestFailure(request, http.StatusBadRequest, "获取最新邮件失败: email 缺失")
 		service.respondError(writer, http.StatusBadRequest, "email 必填")
 		return
 	}
 
 	normalizedMailbox, err := normalizeEmailPoolMailbox(mailbox)
 	if err != nil {
+		service.logRequestFailure(request, http.StatusBadRequest, "获取最新邮件失败: email=%s mailbox=%q err=%v", email, mailbox, err)
 		service.respondError(writer, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	record, err := service.store.getAccountByEmail(request.Context(), email)
 	if err != nil {
-		service.respondUnexpected(writer, err)
+		service.respondUnexpected(writer, request, err)
 		return
 	}
 	if record == nil {
+		service.logRequestFailure(request, http.StatusNotFound, "获取最新邮件失败: email=%s 不存在", email)
 		service.respondError(writer, http.StatusNotFound, "邮箱账号不存在")
 		return
 	}
 
 	latestMail, err := service.mailClient.fetchLatestMail(request.Context(), *record, normalizedMailbox)
 	if err != nil {
+		service.logRequestFailure(request, http.StatusBadGateway, "获取最新邮件失败: account_id=%d email=%s mailbox=%s err=%v", record.ID, record.Email, normalizedMailbox, err)
 		service.respondError(writer, http.StatusBadGateway, err.Error())
 		return
 	}
+	service.logRequestSuccess(request, "获取最新邮件成功: account_id=%d email=%s mailbox=%s", record.ID, record.Email, normalizedMailbox)
 	service.respondEnvelope(writer, http.StatusOK, map[string]any{
 		"account":     record.publicAccount(),
 		"mailbox":     normalizedMailbox,
@@ -1261,14 +1562,25 @@ func (service *emailPoolService) respondError(writer http.ResponseWriter, status
 	})
 }
 
-func (service *emailPoolService) respondUnexpected(writer http.ResponseWriter, err error) {
-	statusCode := http.StatusInternalServerError
-	message := "服务内部错误"
-	if isSQLiteBusyError(err) {
-		statusCode = http.StatusServiceUnavailable
-		message = err.Error()
+// logRequestSuccess 统一记录关键接口的成功日志，便于从服务端快速回放租约和取信主链路。
+func (service *emailPoolService) logRequestSuccess(request *http.Request, format string, args ...any) {
+	service.logf("web_mail 请求成功: method=%s path=%s detail=%s", request.Method, normalizeEmailPoolPath(request.URL.Path), fmt.Sprintf(format, args...))
+}
+
+// logRequestFailure 统一记录关键接口的失败日志，避免 HTTP 已返回但服务端上下文丢失。
+func (service *emailPoolService) logRequestFailure(request *http.Request, statusCode int, format string, args ...any) {
+	service.logf("web_mail 请求失败: method=%s path=%s status=%d detail=%s", request.Method, normalizeEmailPoolPath(request.URL.Path), statusCode, fmt.Sprintf(format, args...))
+}
+
+func (service *emailPoolService) logf(format string, args ...any) {
+	if service.logger != nil {
+		service.logger.Printf(format, args...)
 	}
-	service.respondError(writer, statusCode, message)
+}
+
+func (service *emailPoolService) respondUnexpected(writer http.ResponseWriter, request *http.Request, err error) {
+	service.logRequestFailure(request, http.StatusInternalServerError, "服务内部错误: %v", err)
+	service.respondError(writer, http.StatusInternalServerError, "服务内部错误")
 }
 
 func (service *emailPoolService) respondJSON(writer http.ResponseWriter, statusCode int, payload any) {
@@ -1288,4 +1600,8 @@ func newLeaseToken() (string, error) {
 		return "", fmt.Errorf("生成租约令牌失败: %w", err)
 	}
 	return hex.EncodeToString(randomBytes), nil
+}
+
+func utcNowString() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
