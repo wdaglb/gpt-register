@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -362,11 +361,11 @@ func (store *emailPoolStore) withLockedFile(callback func() error) error {
 		_ = lockFile.Close()
 	}()
 
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockFileExclusive(lockFile); err != nil {
 		return fmt.Errorf("锁定 web_mail 文件失败: %w", err)
 	}
 	defer func() {
-		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lockFile)
 	}()
 
 	return callback()
