@@ -247,9 +247,12 @@ func (c *protocolClient) registerWithProtocol(ctx context.Context, cfg config, l
 	logger.Printf("%s OTP 阶段返回: status=%d", prefix, validateResult.StatusCode)
 
 	profile := randomCreateAccountPayload()
-	if _, err := c.submitCreateAccount(ctx, cfg, bootstrap, profile); err != nil {
+	logger.Printf("%s 准备提交 create_account", prefix)
+	createAccountResult, err := c.submitCreateAccount(ctx, cfg, bootstrap, profile)
+	if err != nil {
 		return newFlowResultError("create_account", err)
 	}
+	logger.Printf("%s create_account 阶段返回: status=%d", prefix, createAccountResult.StatusCode)
 	return nil
 }
 

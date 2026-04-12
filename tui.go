@@ -1494,6 +1494,10 @@ func inferWorkerStatus(line string, previous string) string {
 		return "等待提交通知验证码"
 	case strings.Contains(line, "OTP 阶段返回"):
 		return "验证码已提交"
+	case strings.Contains(line, "准备提交 create_account"):
+		return "准备提交资料"
+	case strings.Contains(line, "create_account 阶段返回"):
+		return "资料已提交"
 	case strings.Contains(line, "密码阶段返回"):
 		return "密码已提交"
 	case strings.Contains(line, "邮箱阶段返回"):

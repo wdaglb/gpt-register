@@ -1,4 +1,5 @@
 artifacts/
+auth/
 user.txt
 accounts.txt
 *.lock

@@ -21,12 +21,22 @@
 
 ## 运行前准备
 
-1. 准备邮箱源文件 `emails.txt`，格式如下：
+1. 准备邮箱池 txt 数据库 `emails.txt`，基础格式如下：
 
 ```text
 email@example.com----password----client_id----refresh_token
 ```
 
+服务启动后会把该文件当作**唯一数据库**直接读写，并在需要时于行尾追加托管字段，例如：
+
+```text
+email@example.com----password----client_id----refresh_token
+email@example.com----password----client_id----refresh_token----lease_token:abc123----leased_at:2026-04-12T12:00:00Z----status:leased
+email@example.com----password----client_id----refresh_token----used_at:2026-04-12T12:05:00Z----status:used
+```
+
+默认 `available` 状态不会单独写出，只有记录处于租出或已使用状态时，服务才会追加 `status`、`lease_token`、`leased_at`、`used_at` 等后缀字段。  
+只有基础四列的旧格式也可以直接使用，缺少的托管字段会在后续状态变更时自动补齐。  
 如果一行里还有额外列，服务会继续保留，并在接口响应的 `extra_fields` 中返回。
 
 2. 启动当前仓库内置的 `web_mail` 服务，例如：
@@ -36,7 +46,6 @@ email@example.com----password----client_id----refresh_token
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
-  -web-mail-db email_pool.sqlite3 \
   -web-mail-emails-file emails.txt
 ```
 
@@ -153,7 +162,6 @@ TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
-  -web-mail-db /Users/wanz/web/my/gpt/go-register/email_pool.sqlite3 \
   -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt \
   -mail-api-base https://www.appleemail.top \
   -web-mail-lease-timeout-seconds 600
@@ -165,7 +173,6 @@ TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
 /Users/wanz/sdk/go1.26.1/bin/go run . \
   -mode webmail \
   -web-mail-sync-only \
-  -web-mail-db /Users/wanz/web/my/gpt/go-register/email_pool.sqlite3 \
   -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt
 ```
 
@@ -316,8 +323,8 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 | `-web-mail-url` | `web_mail` 服务地址，默认 `http://127.0.0.1:8030` |
 | `-web-mail-host` | `webmail` 模式监听地址，默认 `127.0.0.1` |
 | `-web-mail-port` | `webmail` 模式监听端口，默认 `8030` |
-| `-web-mail-db` | `webmail` 模式 SQLite 文件路径，默认项目根目录 `email_pool.sqlite3` |
-| `-web-mail-emails-file` | `webmail` 模式邮箱源文件路径，默认项目根目录 `emails.txt` |
+| `-web-mail-db` | 已废弃兼容参数，当前 `web_mail` 不再使用 SQLite |
+| `-web-mail-emails-file` | `webmail` 模式邮箱池 txt 数据库路径，默认项目根目录 `emails.txt` |
 | `-mail-api-base` | `webmail` 模式上游邮件接口基础地址，默认 `https://www.appleemail.top` |
 | `-web-mail-sync-only` | `webmail` 模式只同步一次邮箱文件后退出 |
 | `-web-mail-lease-timeout-seconds` | `webmail` 模式租约超时秒数，默认 `600` |

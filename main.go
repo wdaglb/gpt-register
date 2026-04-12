@@ -157,8 +157,8 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.webMailURL, "web-mail-url", envOrDefault("WEB_MAIL_URL", "http://127.0.0.1:8030"), "web_mail 服务地址")
 	fs.StringVar(&cfg.webMailHost, "web-mail-host", envOrDefault("WEB_MAIL_HOST", "127.0.0.1"), "web_mail 服务监听地址，仅 webmail 模式生效")
 	fs.IntVar(&cfg.webMailPort, "web-mail-port", 8030, "web_mail 服务监听端口，仅 webmail 模式生效")
-	fs.StringVar(&cfg.webMailDBPath, "web-mail-db", envOrDefault("WEB_MAIL_DB", defaultProjectFile("email_pool.sqlite3")), "web_mail SQLite 数据库文件，仅 webmail 模式生效")
-	fs.StringVar(&cfg.webMailEmailsFile, "web-mail-emails-file", envOrDefault("WEB_MAIL_EMAILS_FILE", defaultProjectFile("emails.txt")), "邮箱源文件路径，仅 webmail 模式生效")
+	fs.StringVar(&cfg.webMailDBPath, "web-mail-db", envOrDefault("WEB_MAIL_DB", ""), "已废弃参数：历史 SQLite 路径，当前 web_mail 直接使用 web-mail-emails-file 持久化")
+	fs.StringVar(&cfg.webMailEmailsFile, "web-mail-emails-file", envOrDefault("WEB_MAIL_EMAILS_FILE", defaultProjectFile("emails.txt")), "邮箱池 txt 数据库文件路径，仅 webmail 模式生效")
 	fs.StringVar(&cfg.mailAPIBase, "mail-api-base", envOrDefault("MAIL_API_BASE", defaultMailAPIBaseURL), "上游邮件接口基础地址，仅 webmail 模式生效")
 	fs.BoolVar(&cfg.webMailSyncOnly, "web-mail-sync-only", false, "仅执行一次邮箱同步后退出，仅 webmail 模式生效")
 	fs.IntVar(&cfg.webMailLeaseTimeoutSeconds, "web-mail-lease-timeout-seconds", defaultWebMailLeaseTimeoutSeconds, "邮箱租约超时秒数，仅 webmail 模式生效")
@@ -203,9 +203,6 @@ func normalizeConfig(cfg config) (config, error) {
 	if cfg.webMailPort > 65535 {
 		return config{}, fmt.Errorf("web-mail-port 必须在 1~65535 之间")
 	}
-	if cfg.webMailDBPath == "" {
-		cfg.webMailDBPath = defaultProjectFile("email_pool.sqlite3")
-	}
 	if cfg.webMailEmailsFile == "" {
 		cfg.webMailEmailsFile = defaultProjectFile("emails.txt")
 	}
@@ -247,7 +244,9 @@ func normalizeConfig(cfg config) (config, error) {
 	}
 
 	cfg.authDir = filepath.Clean(cfg.authDir)
-	cfg.webMailDBPath = filepath.Clean(cfg.webMailDBPath)
+	if cfg.webMailDBPath != "" {
+		cfg.webMailDBPath = filepath.Clean(cfg.webMailDBPath)
+	}
 	cfg.webMailEmailsFile = filepath.Clean(cfg.webMailEmailsFile)
 	return cfg, nil
 }

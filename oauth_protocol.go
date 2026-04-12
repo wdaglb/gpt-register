@@ -18,11 +18,12 @@ import (
 	"strings"
 	"time"
 
+	sentinel "openai-sentinel-go"
+
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"golang.org/x/net/html"
-	sentinel "openai-sentinel-go"
 )
 
 const (
@@ -41,9 +42,12 @@ const (
 )
 
 var (
-	statePattern      = regexp.MustCompile(`state=([^&"'>]+)`)
-	stateValuePattern = regexp.MustCompile(`name=["']state["'][^>]*value=["']([^"']+)["']`)
-	deviceIDPattern   = regexp.MustCompile(`"DeviceId":"([^"]+)"`)
+	statePattern             = regexp.MustCompile(`state=([^&"'>]+)`)
+	stateValuePattern        = regexp.MustCompile(`name=["']state["'][^>]*value=["']([^"']+)["']`)
+	deviceIDPattern          = regexp.MustCompile(`"DeviceId":"([^"]+)"`)
+	workspaceIDPattern       = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	oauthProgressURLPattern  = regexp.MustCompile(`https://auth\.openai\.com/(?:api/oauth/oauth2/auth|api/accounts/consent)[^"'\\s<]+`)
+	oauthProgressPathPattern = regexp.MustCompile(`/(?:api/oauth/oauth2/auth|api/accounts/consent)[^"'\\s<]+`)
 )
 
 // protocolLoginResult 汇总协议登录链路产出的关键结果。
@@ -543,14 +547,19 @@ func (c *protocolClient) finalizeOAuth(ctx context.Context, logger *log.Logger, 
 	switch {
 	case step.Page.Type == "sign_in_with_chatgpt_codex_consent" || strings.Contains(strings.ToLower(nextURL), "consent"):
 		logger.Print("检测到 consent 阶段，准备协议点击同意")
-		callbackURL, err := c.confirmConsentAndCaptureCallback(ctx, session.State, nextURL)
+		callbackURL, err := c.confirmConsentAndCaptureCallback(ctx, logger, session.State, nextURL)
 		if err != nil {
 			return nil, newFlowResultError("oauth_consent", err)
 		}
 		return buildProtocolLoginResultFromCallback(callbackURL, session.State)
 	case nextURL != "":
-		if strings.Contains(nextURL, "localhost:1455") {
-			return buildProtocolLoginResultFromCallback(nextURL, session.State)
+		if callbackURL := extractOAuthCallbackURL(nextURL); callbackURL != "" {
+			return buildProtocolLoginResultFromCallback(callbackURL, session.State)
+		}
+		logger.Printf("检测到 OAuth 后续跳转，准备继续跟进: %s", trimForLog(nextURL))
+		callbackURL, err := c.followOAuthRedirectChain(ctx, nextURL, auth0BaseURL)
+		if err == nil && callbackURL != "" {
+			return buildProtocolLoginResultFromCallback(callbackURL, session.State)
 		}
 	}
 
@@ -564,8 +573,8 @@ func (c *protocolClient) finalizeOAuth(ctx context.Context, logger *log.Logger, 
 
 func extractCallbackURLFromEnvelope(step authAPIEnvelope) string {
 	for _, candidate := range []string{step.Page.Payload.URL, step.ContinueURL} {
-		if strings.Contains(candidate, "localhost:1455") {
-			return candidate
+		if callbackURL := extractOAuthCallbackURL(candidate); callbackURL != "" {
+			return callbackURL
 		}
 	}
 	return ""
@@ -595,7 +604,7 @@ func buildProtocolLoginResultFromCallback(callbackURL, expectedState string) (*p
 }
 
 // confirmConsentAndCaptureCallback 以纯协议方式打开 consent 页、提交表单，并抓取最终 callback。
-func (c *protocolClient) confirmConsentAndCaptureCallback(ctx context.Context, state, consentURL string) (string, error) {
+func (c *protocolClient) confirmConsentAndCaptureCallback(ctx context.Context, logger *log.Logger, state, consentURL string) (string, error) {
 	if strings.TrimSpace(consentURL) == "" {
 		return c.resumeAndCaptureCallback(ctx, state)
 	}
@@ -611,32 +620,141 @@ func (c *protocolClient) confirmConsentAndCaptureCallback(ctx context.Context, s
 	if err != nil {
 		return "", fmt.Errorf("打开 consent 页面失败: %w", err)
 	}
+	writeDebugHTTPResult("oauth_consent_page", pageResult)
 
 	if callbackURL := extractCallbackURLFromHTTPResult(pageResult); callbackURL != "" {
 		return callbackURL, nil
 	}
 
 	form, err := extractFirstHTMLForm(pageResult.Body, pageResult.FinalURL)
-	if err != nil {
-		if stateFromPage := extractState(pageResult.Body); stateFromPage != "" {
-			return c.resumeAndCaptureCallback(ctx, stateFromPage)
+	if err == nil {
+		submitResult, submitErr := c.submitHTMLForm(ctx, form, pageResult.FinalURL)
+		if submitErr == nil {
+			writeDebugHTTPResult("oauth_consent_submit", submitResult)
+			if callbackURL, callbackErr := c.captureCallbackFromResult(ctx, submitResult); callbackErr == nil && callbackURL != "" {
+				return callbackURL, nil
+			}
+		} else if logger != nil {
+			logger.Printf("直接提交 consent form 失败，准备走 workspace/select 链路: %v", submitErr)
 		}
-		return c.resumeAndCaptureCallback(ctx, state)
 	}
 
-	submitResult, err := c.submitHTMLForm(ctx, form, pageResult.FinalURL)
-	if err != nil {
-		return "", fmt.Errorf("提交 consent 表单失败: %w", err)
+	workspaceID := extractConsentWorkspaceID(pageResult.Body)
+	if workspaceID == "" && form != nil {
+		workspaceID = strings.TrimSpace(form.Values.Get("workspace_id"))
+	}
+	if workspaceID != "" {
+		if logger != nil {
+			logger.Printf("已从 consent 页面提取 workspace_id=%s", workspaceID)
+		}
+		workspaceResult, workspaceErr := c.selectConsentWorkspace(ctx, pageResult.FinalURL, workspaceID)
+		if workspaceErr == nil {
+			writeDebugHTTPResult("oauth_consent_workspace_select", workspaceResult)
+			if callbackURL, callbackErr := c.captureCallbackFromResult(ctx, workspaceResult); callbackErr == nil && callbackURL != "" {
+				return callbackURL, nil
+			}
+		} else if logger != nil {
+			logger.Printf("workspace/select 请求失败，准备回退: %v", workspaceErr)
+		}
 	}
 
-	if callbackURL := extractCallbackURLFromHTTPResult(submitResult); callbackURL != "" {
+	if stateFromPage := extractState(pageResult.Body); stateFromPage != "" {
+		return c.resumeAndCaptureCallback(ctx, stateFromPage)
+	}
+	return c.resumeAndCaptureCallback(ctx, state)
+}
+
+// captureCallbackFromResult 从当前 HTTP 结果里尽可能提取 callback，或继续沿着 OAuth 中间跳转推进。
+// Why: consent 后半段会混合出现 JSON、302 和中间 challenge URL，把“从结果里找下一步”收敛成一个函数更不容易漏分支。
+func (c *protocolClient) captureCallbackFromResult(ctx context.Context, result *httpResult) (string, error) {
+	if callbackURL := extractCallbackURLFromHTTPResult(result); callbackURL != "" {
 		return callbackURL, nil
 	}
 
-	if nextState := firstNonEmpty(extractState(submitResult.Location), extractState(submitResult.FinalURL), extractState(submitResult.Body), state); nextState != "" {
-		return c.resumeAndCaptureCallback(ctx, nextState)
+	for _, candidate := range extractOAuthProgressCandidates(result) {
+		callbackURL, err := c.followOAuthRedirectChain(ctx, candidate, result.FinalURL)
+		if err == nil && callbackURL != "" {
+			return callbackURL, nil
+		}
 	}
-	return "", fmt.Errorf("consent 提交后未捕获到 callback")
+	return "", fmt.Errorf("当前结果里没有可继续的 OAuth callback 线索")
+}
+
+// followOAuthRedirectChain 以“手动跟跳”的方式继续推进 OAuth 后半段，直到抓到带 code/state 的回调地址。
+// Why: 新链路里 callback 可能不是直接 302 到 localhost，而是先返回 external_url 或中间 callback URL；手动逐跳比只盯一次 Location 更稳。
+func (c *protocolClient) followOAuthRedirectChain(ctx context.Context, startURL, referer string) (string, error) {
+	currentURL := strings.TrimSpace(startURL)
+	currentReferer := strings.TrimSpace(referer)
+	visited := map[string]struct{}{}
+
+	for attempt := 0; attempt < 8; attempt++ {
+		if callbackURL := extractOAuthCallbackURL(currentURL); callbackURL != "" {
+			return callbackURL, nil
+		}
+		if _, exists := visited[currentURL]; exists {
+			break
+		}
+		visited[currentURL] = struct{}{}
+
+		result, err := c.doRequest(ctx, requestOptions{
+			Method:        http.MethodGet,
+			URL:           currentURL,
+			AllowRedirect: false,
+			Accept:        auth0AcceptHeader,
+			Referer:       currentReferer,
+			Profile:       profileNavigate,
+		})
+		if err != nil {
+			return "", fmt.Errorf("跟进 OAuth 跳转失败: %w", err)
+		}
+		writeDebugHTTPResult(fmt.Sprintf("oauth_follow_%d", attempt), result)
+
+		if callbackURL := extractCallbackURLFromHTTPResult(result); callbackURL != "" {
+			return callbackURL, nil
+		}
+
+		step := parseAuthAPIEnvelope(result.Body)
+		if callbackURL := extractCallbackURLFromEnvelope(step); callbackURL != "" {
+			return callbackURL, nil
+		}
+
+		nextURL := firstNonEmpty(
+			resolveRelativeURL(result.FinalURL, result.Location),
+			resolveRelativeURL(result.FinalURL, step.Page.Payload.URL),
+			resolveRelativeURL(result.FinalURL, step.ContinueURL),
+		)
+		if strings.TrimSpace(nextURL) == "" || nextURL == currentURL {
+			break
+		}
+		currentReferer = currentURL
+		currentURL = nextURL
+	}
+
+	return "", fmt.Errorf("跟进 OAuth 跳转后仍未捕获到 callback")
+}
+
+// selectConsentWorkspace 模拟 consent 页点击 Continue 之后的前端工作区选择请求。
+// Why: 最新链路会先 POST workspace/select，再进入带 login_verifier 的 oauth2/auth；如果跳过这一步，就拿不到后续 challenge URL。
+func (c *protocolClient) selectConsentWorkspace(ctx context.Context, referer, workspaceID string) (*httpResult, error) {
+	payload := strings.NewReader(fmt.Sprintf(`{"workspace_id":%q}`, workspaceID))
+	result, err := c.doRequest(ctx, requestOptions{
+		Method:        http.MethodPost,
+		URL:           "https://auth.openai.com/api/accounts/workspace/select",
+		AllowRedirect: false,
+		Accept:        "application/json",
+		ContentType:   "application/json",
+		Referer:       referer,
+		Origin:        "https://auth.openai.com",
+		Profile:       profileAPI,
+		Body:          payload,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("选择 consent workspace 失败: %w", err)
+	}
+	if result.StatusCode < 200 || result.StatusCode >= 300 {
+		return nil, fmt.Errorf("workspace/select 返回异常状态: %d body=%s", result.StatusCode, limitBody(result.Body))
+	}
+	return result, nil
 }
 
 func (c *protocolClient) submitHTMLForm(ctx context.Context, form *htmlForm, referer string) (*httpResult, error) {
@@ -712,6 +830,76 @@ func extractFirstHTMLForm(rawHTML, baseURL string) (*htmlForm, error) {
 		Method:    method,
 		Values:    values,
 	}, nil
+}
+
+func extractConsentWorkspaceID(rawHTML string) string {
+	if strings.TrimSpace(rawHTML) == "" {
+		return ""
+	}
+
+	if form, err := extractFirstHTMLForm(rawHTML, "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"); err == nil {
+		if workspaceID := strings.TrimSpace(form.Values.Get("workspace_id")); workspaceID != "" {
+			return workspaceID
+		}
+	}
+
+	lowerHTML := strings.ToLower(rawHTML)
+	workspacesIndex := strings.Index(lowerHTML, "workspaces")
+	if workspacesIndex < 0 {
+		return ""
+	}
+	segment := rawHTML[workspacesIndex:]
+	if len(segment) > 2048 {
+		segment = segment[:2048]
+	}
+	return workspaceIDPattern.FindString(segment)
+}
+
+func extractOAuthProgressCandidates(result *httpResult) []string {
+	if result == nil {
+		return nil
+	}
+
+	candidates := make([]string, 0, 8)
+	seen := map[string]struct{}{}
+	appendCandidate := func(candidate string) {
+		resolved := resolveRelativeURL(result.FinalURL, candidate)
+		resolved = strings.TrimSpace(resolved)
+		if resolved == "" {
+			return
+		}
+		if callbackURL := extractOAuthCallbackURL(resolved); callbackURL != "" {
+			resolved = callbackURL
+		}
+		if _, exists := seen[resolved]; exists {
+			return
+		}
+		seen[resolved] = struct{}{}
+		candidates = append(candidates, resolved)
+	}
+
+	appendCandidate(result.Location)
+	appendCandidate(result.FinalURL)
+
+	step := parseAuthAPIEnvelope(result.Body)
+	appendCandidate(step.Page.Payload.URL)
+	appendCandidate(step.ContinueURL)
+
+	bodyForSearch := strings.ReplaceAll(result.Body, `\/`, `/`)
+	for _, match := range oauthProgressURLPattern.FindAllString(bodyForSearch, -1) {
+		appendCandidate(match)
+	}
+	for _, match := range oauthProgressPathPattern.FindAllString(bodyForSearch, -1) {
+		appendCandidate(match)
+	}
+
+	filtered := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if strings.Contains(candidate, "/api/oauth/oauth2/auth") || strings.Contains(candidate, "/api/accounts/consent") || extractOAuthCallbackURL(candidate) != "" {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
 }
 
 func collectFormValues(root *html.Node, values url.Values) {
@@ -818,12 +1006,33 @@ func extractCallbackURLFromHTTPResult(result *httpResult) string {
 	if result == nil {
 		return ""
 	}
-	for _, candidate := range []string{result.Location, result.FinalURL, extractState(result.Body)} {
-		if strings.Contains(candidate, "localhost:1455") {
-			return candidate
+	for _, candidate := range []string{result.Location, result.FinalURL} {
+		if callbackURL := extractOAuthCallbackURL(candidate); callbackURL != "" {
+			return callbackURL
 		}
 	}
+	if callbackURL := extractCallbackURLFromEnvelope(parseAuthAPIEnvelope(result.Body)); callbackURL != "" {
+		return callbackURL
+	}
 	return ""
+}
+
+func extractOAuthCallbackURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+
+	query := parsed.Query()
+	if query.Get("code") == "" || query.Get("state") == "" {
+		return ""
+	}
+	return trimmed
 }
 
 func firstNonEmpty(values ...string) string {
@@ -1110,12 +1319,10 @@ func (c *protocolClient) resumeAndCaptureCallback(ctx context.Context, state str
 		if err != nil {
 			return "", fmt.Errorf("恢复 OAuth 会话失败: %w", err)
 		}
+		writeDebugHTTPResult(fmt.Sprintf("oauth_resume_%d", attempt), result)
 
-		if strings.Contains(result.Location, "localhost:1455") {
-			return result.Location, nil
-		}
-		if strings.Contains(result.FinalURL, "localhost:1455") {
-			return result.FinalURL, nil
+		if callbackURL := extractCallbackURLFromHTTPResult(result); callbackURL != "" {
+			return callbackURL, nil
 		}
 		if result.Location != "" && extractState(result.Location) != "" {
 			state = extractState(result.Location)
