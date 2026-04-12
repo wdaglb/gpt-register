@@ -15,7 +15,7 @@
   - `webmail`：只启动邮箱池 HTTP 服务
   - `register`：只注册
   - `authorize`：只授权
-  - `pipeline`：注册线程与授权线程独立运行，共享 `accounts.txt`
+  - `pipeline`：注册线程与授权线程独立运行，共享 `accounts.txt`，注册达标后仍会等待授权线程收尾
   - `login`：单账号登录调试
 - 使用线程锁 + 文件锁保护 `accounts.txt`，避免并发写乱
 
@@ -372,7 +372,7 @@ go-register \
 | `-web-mail-sync-only` | `webmail` 模式只同步一次邮箱文件后退出 |
 | `-web-mail-lease-timeout-seconds` | `webmail` 模式租约超时秒数，默认 `600` |
 | `-proxy` | HTTP/HTTPS 代理地址 |
-| `-count` | 注册数量，仅 `register` / `pipeline` 生效。交互终端下会被 TUI 页面中的 count 覆盖 |
+| `-count` | 注册数量。`register` 模式表示注册尝试数；`pipeline` 模式表示目标注册成功数，注册达标后仍会等待已入队账号授权完成；若邮箱池提示“当前没有可用邮箱账号”，会停止继续补注册 |
 | `-workers` | 注册并发数，或 `authorize` 模式的授权并发数。交互终端下会被 TUI 页面中的 workers 覆盖 |
 | `-authorize-workers` | `pipeline` 模式下的授权并发数。交互终端下会被 TUI 页面中的 authorize-workers 覆盖 |
 | `-mailbox` | 优先轮询的邮箱目录，默认 `Junk` |

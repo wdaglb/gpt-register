@@ -54,22 +54,28 @@ const (
 	tuiPhaseConfig tuiPhase = "config"
 )
 
+const (
+	tuiHomeActionStart = iota
+	tuiHomeActionConfig
+	tuiHomeActionTotal
+)
+
 var (
 	tuiMutedStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	tuiValueStyle          = lipgloss.NewStyle().Bold(true)
 	tuiSuccessStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	tuiFailStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true)
-	tuiFooterStyle         = lipgloss.NewStyle().BorderTop(true).Padding(0, 1)
+	tuiFooterStyle         = lipgloss.NewStyle().Padding(0, 1)
 	tuiTitleStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
-	tuiCardStyle           = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2)
+	tuiCardStyle           = lipgloss.NewStyle().Padding(0, 1)
 	tuiFieldLabelStyle     = lipgloss.NewStyle().Width(20).Foreground(lipgloss.Color("248"))
 	tuiFocusedLabelStyle   = lipgloss.NewStyle().Width(20).Foreground(lipgloss.Color("86")).Bold(true)
 	tuiSelectedModeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62")).Padding(0, 1).Bold(true)
 	tuiUnselectedModeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Padding(0, 1)
 	tuiStartButtonStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("62")).Padding(0, 2).Bold(true)
-	tuiStartIdleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	tuiLogCardStyle        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
-	tuiFocusedLogCardStyle = tuiLogCardStyle.Copy().BorderForeground(lipgloss.Color("86"))
+	tuiStartIdleStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Padding(0, 1)
+	tuiLogCardStyle        = lipgloss.NewStyle().Padding(0, 0)
+	tuiFocusedLogCardStyle = tuiLogCardStyle.Copy()
 	tuiCardTitleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 	tuiCardSubtitleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
@@ -305,6 +311,7 @@ type runTUIModel struct {
 
 	modeIndex    int
 	focusIndex   int
+	homeActionIndex int
 	configError  string
 	configNotice string
 
@@ -352,6 +359,7 @@ func newRunTUIModel(cfg config, ready chan struct{}, startCh chan<- config, load
 		phase:                 tuiPhaseHome,
 		modeIndex:             tuiModeIndex(cfg.mode),
 		focusIndex:            tuiFocusMode,
+		homeActionIndex:       tuiHomeActionStart,
 		webMailURLInput:       newTUIStringInput(cfg.webMailURL, false),
 		emailInput:            newTUIStringInput(cfg.email, false),
 		passwordInput:         newTUIStringInput(cfg.password, true),
@@ -448,34 +456,28 @@ func (model *runTUIModel) View() string {
 	return model.homeView()
 }
 
-// homeView 只负责渲染首页卡片列表与底部统计栏。
-// Why: 用户要求把首页收敛为纯 worker 卡片视图，因此首页和配置页必须分开渲染，避免两者继续混在一个界面里。
+// homeView 只负责渲染首页日志区与底部统计栏。
+// Why: 任务卡片已经被移除，首页现在回归成单一监控视图；配置页仍然独立，避免运行态和表单态混杂。
 func (model *runTUIModel) homeView() string {
 	return lipgloss.JoinVertical(lipgloss.Left, model.homeToolbarView(), model.viewport.View(), model.footerView())
 }
 
-// updateHomePhase 处理首页的切页和滚动行为。
-// Why: 首页被定义成监控主视图，按键应优先服务于“查看卡片”和“进入配置”，而不是继续消费表单导航语义。
+// updateHomePhase 处理首页日志滚动和启动行为。
+// Why: 去掉任务卡片后，首页只保留日志浏览，因此按键语义也应收敛到“滚日志”和“进入配置”。
 func (model *runTUIModel) updateHomePhase(message tea.Msg) tea.Cmd {
 	if keyMsg, ok := message.(tea.KeyMsg); ok {
 		switch keyMsg.String() {
 		case "ctrl+c":
 			return tea.Quit
-		case "tab":
-			model.shiftFocusedCard(1)
-			model.syncViewportContent()
+		case "tab", "right":
+			if !model.running {
+				model.shiftHomeActionFocus(1)
+			}
 			return nil
-		case "shift+tab":
-			model.shiftFocusedCard(-1)
-			model.syncViewportContent()
-			return nil
-		case "left":
-			model.shiftFocusedCard(-1)
-			model.syncViewportContent()
-			return nil
-		case "right":
-			model.shiftFocusedCard(1)
-			model.syncViewportContent()
+		case "shift+tab", "left":
+			if !model.running {
+				model.shiftHomeActionFocus(-1)
+			}
 			return nil
 		case "up", "k":
 			model.scrollFocusedCard(1)
@@ -485,16 +487,21 @@ func (model *runTUIModel) updateHomePhase(message tea.Msg) tea.Cmd {
 			model.scrollFocusedCard(-1)
 			model.syncViewportContent()
 			return nil
-		case "enter", "ctrl+s":
+		case "enter":
+			if model.running {
+				return nil
+			}
+			switch model.homeActionIndex {
+			case tuiHomeActionConfig:
+				return model.switchToConfigPage()
+			default:
+				return model.startRun()
+			}
+		case "ctrl+s":
 			if model.running {
 				return nil
 			}
 			return model.startRun()
-		case "c":
-			if model.running {
-				return nil
-			}
-			return model.switchToConfigPage()
 		}
 	}
 
@@ -506,13 +513,13 @@ func (model *runTUIModel) updateHomePhase(message tea.Msg) tea.Cmd {
 // homeToolbarView 渲染首页固定操作区，集中展示当前配置摘要和开始按钮。
 // Why: 用户要求把开始按钮放到首页，因此首页必须有一个固定操作区，而不是把启动操作藏在配置页里。
 func (model *runTUIModel) homeToolbarView() string {
-	registerWorkers, authorizeWorkers := workerCardLayoutForMode(model.currentMode(), model.currentPreviewWorkers(), model.currentPreviewAuthorizeWorkers())
 	rows := []string{
-		tuiTitleStyle.Render("Worker 首页"),
-		tuiMutedStyle.Render(fmt.Sprintf("当前模式：%s    注册 Worker：%d    授权 Worker：%d", displayRunMode(model.currentMode()), registerWorkers, authorizeWorkers)),
+		tuiTitleStyle.Render("Worker 首页 · 当前模式：" + displayRunMode(model.currentMode())),
 		lipgloss.JoinHorizontal(
 			lipgloss.Left,
 			model.renderHomeStartButton(),
+			"  ",
+			model.renderHomeConfigButton(),
 			"  ",
 			tuiMutedStyle.Render(homeActionHint(model.running)),
 		),
@@ -522,7 +529,7 @@ func (model *runTUIModel) homeToolbarView() string {
 	if cardWidth := model.toolbarCardWidth(); cardWidth > 0 {
 		style = style.Width(cardWidth)
 	}
-	return lipgloss.NewStyle().Padding(1, 1, 0, 1).Render(style.Render(strings.Join(rows, "\n")))
+	return lipgloss.NewStyle().Padding(0, 1, 0, 1).Render(style.Render(strings.Join(rows, "\n")))
 }
 
 // updateConfigPhase 处理独立配置页表单的导航与提交。
@@ -662,22 +669,40 @@ func (model *runTUIModel) renderSaveButton() string {
 // renderHomeStartButton 渲染首页的开始按钮。
 // Why: 启动动作已经从配置页移到首页，因此首页必须明确展示当前是否可启动，而不能只靠底栏提示。
 func (model *runTUIModel) renderHomeStartButton() string {
+	if !model.running && model.homeActionIndex == tuiHomeActionStart {
+		if model.finished {
+			return tuiStartButtonStyle.Render("再次开始")
+		}
+		return tuiStartButtonStyle.Render("开始运行")
+	}
 	if model.running {
 		return tuiStartIdleStyle.Render("运行中")
 	}
 	if model.finished {
-		return tuiStartButtonStyle.Render("再次开始")
+		return tuiStartIdleStyle.Render("再次开始")
 	}
-	return tuiStartButtonStyle.Render("开始运行")
+	return tuiStartIdleStyle.Render("开始运行")
+}
+
+// renderHomeConfigButton 渲染首页的系统配置按钮。
+// Why: 用户要求配置入口通过首页按钮进入，而不是依赖单独快捷键，因此这里提供显式操作入口。
+func (model *runTUIModel) renderHomeConfigButton() string {
+	if model.running {
+		return tuiStartIdleStyle.Render("系统配置")
+	}
+	if model.homeActionIndex == tuiHomeActionConfig {
+		return tuiStartButtonStyle.Render("系统配置")
+	}
+	return tuiStartIdleStyle.Render("系统配置")
 }
 
 // homeActionHint 返回首页操作区旁边的辅助提示。
 // Why: 首页不再承担参数编辑职责，因此需要用一句短提示把“开始”和“去配置页”的入口同时讲清楚。
 func homeActionHint(running bool) string {
 	if running {
-		return "Tab/左右切卡片，上下滚当前卡片，c 配置，PgUp/PgDn 滚整页"
+		return "上下滚日志，PgUp/PgDn 滚整页"
 	}
-	return "Enter / Ctrl+S 开始，Tab/左右切卡片，上下滚当前卡片，c 配置"
+	return "Tab/左右切换按钮，Enter 执行，上下滚日志"
 }
 
 // switchToConfigPage 负责从首页进入配置页，并把光标落到首个可编辑字段。
@@ -692,6 +717,7 @@ func (model *runTUIModel) switchToConfigPage() tea.Cmd {
 // Why: 首页既要支持首次启动前预览，也要支持任务结束后继续修改下一轮配置，因此回首页时需要按当前表单重建下一轮预览。
 func (model *runTUIModel) switchToHomePage() tea.Cmd {
 	model.phase = tuiPhaseHome
+	model.homeActionIndex = tuiHomeActionStart
 	for _, input := range model.allInputs() {
 		input.Blur()
 	}
@@ -904,17 +930,13 @@ func (model *runTUIModel) resetRunMetrics() {
 	model.registerFinishedAt = time.Time{}
 }
 
-// appendLog 把单条日志按 worker 路由到对应卡片。
-// Why: 用户需要按 worker 查看执行细节，因此日志必须先分类，再渲染成可滚动卡片列表。
+// appendLog 把单条日志追加到统一系统日志视图。
+// Why: 任务卡片已经被移除，但日志内容里仍保留 worker 前缀，既能节省界面高度，也不会丢失来源信息。
 func (model *runTUIModel) appendLog(line string) {
 	cardID, title, subtitle, displayLine := classifyTUILogLine(line)
 	card := model.ensureLogCard(cardID, title, subtitle)
-	if subtitle != "" {
-		if card.Kind == "system" {
-			card.Subtitle = subtitle
-		} else {
-			card.CurrentAccount = subtitle
-		}
+	if subtitle != "" && card.Kind == "system" {
+		card.Subtitle = subtitle
 	}
 	card.LastStatus = inferWorkerStatus(displayLine, card.LastStatus)
 	card.UpdatedAt = time.Now()
@@ -962,15 +984,10 @@ func (model *runTUIModel) resetRunningCards() {
 	model.ensureLogCard(tuiSystemCardID, "系统日志", "汇总主流程与未绑定 worker 的输出")
 }
 
-// rebuildPreviewCards 按配置页当前输入重建首页的占位卡片。
-// Why: 首页在空闲态下承担“下一轮任务预览”职责，必须从表单即时推导 worker 数量，而不是强依赖上一轮运行配置。
+// rebuildPreviewCards 在空闲态下重置首页日志视图。
+// Why: 首页不再展示 worker 占位卡片，但切回首页时仍要清理上一轮运行期残留的瞬时 UI 状态。
 func (model *runTUIModel) rebuildPreviewCards() {
 	model.resetRunningCards()
-	model.seedWorkerCardsForConfig(config{
-		mode:             model.currentMode(),
-		workers:          parsePreviewPositiveInt(model.workersInput.Value(), model.baseConfig.workers),
-		authorizeWorkers: parsePreviewPositiveInt(model.authorizeWorkersInput.Value(), model.baseConfig.authorizeWorkers),
-	})
 	model.syncViewportContent()
 }
 
@@ -1019,51 +1036,12 @@ func (model *runTUIModel) ensureLogCard(cardID, title, subtitle string) *tuiLogC
 }
 
 func (model *runTUIModel) renderRunningCards() string {
-	if len(model.cardOrder) == 0 {
-		return tuiMutedStyle.Render("等待 worker 日志...")
+	systemCard, ok := model.logCards[tuiSystemCardID]
+	if !ok || systemCard == nil {
+		return tuiMutedStyle.Render("等待日志...")
 	}
 	model.ensureFocusedLogCard()
-
-	var systemCard *tuiLogCard
-	registerCards := make([]*tuiLogCard, 0, len(model.cardOrder))
-	authorizeCards := make([]*tuiLogCard, 0, len(model.cardOrder))
-	otherCards := make([]*tuiLogCard, 0, len(model.cardOrder))
-	for _, cardID := range model.cardOrder {
-		card, ok := model.logCards[cardID]
-		if !ok {
-			continue
-		}
-		switch card.Kind {
-		case "system":
-			systemCard = card
-		case "worker":
-			registerCards = append(registerCards, card)
-		case "auth":
-			authorizeCards = append(authorizeCards, card)
-		default:
-			otherCards = append(otherCards, card)
-		}
-	}
-
-	sections := make([]string, 0, 3)
-	if systemCard != nil {
-		sections = append(sections, model.renderLogCard(systemCard, model.fullCardWidth(), false))
-	}
-
-	twoColumn := model.renderTwoColumnCards(registerCards, authorizeCards)
-	if twoColumn != "" {
-		sections = append(sections, twoColumn)
-	}
-
-	if len(otherCards) > 0 {
-		extra := make([]string, 0, len(otherCards))
-		for _, card := range otherCards {
-			extra = append(extra, model.renderLogCard(card, model.fullCardWidth(), model.isFocusedCard(card.ID)))
-		}
-		sections = append(sections, strings.Join(extra, strings.Repeat("\n", tuiRunningCardGap+1)))
-	}
-
-	return strings.Join(sections, strings.Repeat("\n", tuiRunningCardGap+1))
+	return model.renderLogCard(systemCard, model.fullCardWidth(), model.isFocusedCard(systemCard.ID))
 }
 
 func (model *runTUIModel) renderTwoColumnCards(registerCards []*tuiLogCard, authorizeCards []*tuiLogCard) string {
@@ -1141,7 +1119,7 @@ func (model *runTUIModel) fullCardWidth() int {
 	if model.width <= 0 {
 		return 0
 	}
-	cardWidth := model.viewportContentWidth() - tuiLogCardStyle.GetHorizontalFrameSize()
+	cardWidth := model.viewportContentWidth()
 	if cardWidth < 20 {
 		return 20
 	}
@@ -1163,20 +1141,20 @@ func (model *runTUIModel) cardVisibleLogLines(kind string) int {
 	if kind == "system" {
 		switch {
 		case model.height >= 42:
-			return 10
-		case model.height >= 32:
 			return 8
-		default:
+		case model.height >= 32:
 			return 6
+		default:
+			return 5
 		}
 	}
 	switch {
 	case model.height >= 42:
-		return 6
-	case model.height >= 32:
 		return 5
-	default:
+	case model.height >= 32:
 		return 4
+	default:
+		return 3
 	}
 }
 
@@ -1362,20 +1340,20 @@ func (model *runTUIModel) viewportContentWidth() int {
 	return contentWidth
 }
 
-// toolbarCardWidth 返回首页工具栏卡片的内部宽度。
-// Why: 工具栏外层还有左右 padding，卡片自身也有 border/padding，如果直接拿终端宽度会导致右边框被裁切。
+// toolbarCardWidth 返回首页工具栏内容宽度。
+// Why: 边框已移除，这里只保留最小安全宽度约束，避免标题和按钮在窄终端里过度压缩。
 func (model *runTUIModel) toolbarCardWidth() int {
-	contentWidth := model.viewportContentWidth() - tuiCardStyle.GetHorizontalFrameSize() - 2
+	contentWidth := model.viewportContentWidth()
 	if contentWidth < 20 {
 		return 20
 	}
 	return contentWidth
 }
 
-// configCardWidth 返回配置页主卡片的内部宽度，并限制在可读范围内。
-// Why: 配置页和首页工具栏共用同一套边框样式，宽度计算必须同样扣掉 frame 和外层 padding，才能保证右侧边框完整。
+// configCardWidth 返回配置页主区域的内容宽度，并限制在可读范围内。
+// Why: 去掉边框后仍需要控制配置页横向阅读宽度，避免超宽终端下表单过长影响扫描效率。
 func (model *runTUIModel) configCardWidth() int {
-	contentWidth := model.viewportContentWidth() - tuiCardStyle.GetHorizontalFrameSize() - 2
+	contentWidth := model.viewportContentWidth()
 	if contentWidth > 104 {
 		contentWidth = 104
 	}
@@ -1386,6 +1364,13 @@ func (model *runTUIModel) configCardWidth() int {
 }
 
 func (model *runTUIModel) footerView() string {
+	workerLine := lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		tuiMutedStyle.Render("线程 "),
+		tuiValueStyle.Render(model.workerSummaryText()),
+		tuiMutedStyle.Render("   平均注册速度 "),
+		tuiValueStyle.Render(formatAverageRegisterSpeed(model.registerStartedAt, model.registerFinishedAt, model.registerSuccess+model.registerFail)),
+	)
 	statsLine := lipgloss.JoinHorizontal(
 		lipgloss.Left,
 		renderStat("注册成功", model.registerSuccess, tuiSuccessStyle),
@@ -1393,14 +1378,9 @@ func (model *runTUIModel) footerView() string {
 		renderStat("授权成功", model.authorizeSuccess, tuiSuccessStyle),
 		renderStat("授权失败", model.authorizeFail, tuiFailStyle),
 	)
-	speedLine := lipgloss.JoinHorizontal(
-		lipgloss.Left,
-		tuiMutedStyle.Render("平均注册速度 "),
-		tuiValueStyle.Render(formatAverageRegisterSpeed(model.registerStartedAt, model.registerFinishedAt, model.registerSuccess+model.registerFail)),
-	)
 	hintLine := tuiMutedStyle.Render(model.footerHint())
 
-	footer := lipgloss.JoinVertical(lipgloss.Left, statsLine, speedLine, hintLine)
+	footer := lipgloss.JoinVertical(lipgloss.Left, statsLine, workerLine, hintLine)
 	style := tuiFooterStyle
 	if model.width > 0 {
 		style = style.Width(model.width)
@@ -1408,16 +1388,29 @@ func (model *runTUIModel) footerView() string {
 	return style.Render(footer)
 }
 
+// workerSummaryText 返回底部状态栏里展示的 worker 数量摘要。
+// Why: 用户希望把线程数量从顶部摘要挪到底栏，启动前预览和运行中状态都应使用同一套文案。
+func (model *runTUIModel) workerSummaryText() string {
+	registerWorkers, authorizeWorkers := workerCardLayoutForMode(model.currentMode(), model.currentPreviewWorkers(), model.currentPreviewAuthorizeWorkers())
+	return fmt.Sprintf("注册线程=%d，授权线程=%d", registerWorkers, authorizeWorkers)
+}
+
 // footerHint 统一返回首页底栏提示，避免首页和运行态分别维护两套快捷键文案。
 // Why: 首页已经不再展示配置表单，用户只能从底栏感知“如何进入配置页”以及“当前是否已启动”。
 func (model *runTUIModel) footerHint() string {
 	if model.finished {
-		return "任务已结束：c 配置，Enter/Ctrl+S 再次开始，Tab/左右切卡片，上下滚当前卡片。"
+		return "任务已结束：Tab/左右切换按钮，Enter 执行，上下滚日志。"
 	}
 	if model.running {
-		return "运行中：Tab/左右切卡片，上下滚当前卡片，PgUp/PgDn 滚整页，Ctrl+C 退出。"
+		return "运行中：上下滚日志，PgUp/PgDn 滚整页，Ctrl+C 退出。"
 	}
-	return "首页预览：Enter/Ctrl+S 开始，c 配置，Tab/左右切卡片，上下滚当前卡片。"
+	return "首页预览：Tab/左右切换按钮，Enter 执行，上下滚日志。"
+}
+
+// shiftHomeActionFocus 切换首页顶部按钮焦点。
+// Why: 去掉配置快捷键后，首页按钮焦点成为唯一的配置入口，因此需要稳定的按钮切换行为。
+func (model *runTUIModel) shiftHomeActionFocus(delta int) {
+	model.homeActionIndex = (model.homeActionIndex + delta + tuiHomeActionTotal) % tuiHomeActionTotal
 }
 
 func renderStat(label string, value int, valueStyle lipgloss.Style) string {
@@ -1431,27 +1424,7 @@ func renderStat(label string, value int, valueStyle lipgloss.Style) string {
 
 func classifyTUILogLine(line string) (cardID string, title string, subtitle string, displayLine string) {
 	trimmed := strings.TrimSpace(strings.TrimPrefix(line, "[go-register] "))
-	match := tuiWorkerLogPattern.FindStringSubmatchIndex(trimmed)
-	if match == nil {
-		return tuiSystemCardID, "系统日志", "汇总主流程与未绑定 worker 的输出", trimmed
-	}
-
-	workerKind := trimmed[match[2]:match[3]]
-	workerIndex := trimmed[match[4]:match[5]]
-	cardID = workerKind + "-" + workerIndex
-	title = displayWorkerCardTitle(workerKind, workerIndex)
-
-	if match[6] >= 0 && match[7] >= 0 {
-		subtitle = trimmed[match[6]:match[7]]
-	}
-
-	prefix := strings.TrimSpace(trimmed[:match[0]])
-	suffix := strings.TrimSpace(trimmed[match[1]:])
-	displayLine = strings.TrimSpace(strings.TrimSpace(prefix + " " + suffix))
-	if displayLine == "" {
-		displayLine = trimmed
-	}
-	return cardID, title, subtitle, displayLine
+	return tuiSystemCardID, "系统日志", "汇总所有运行日志", trimmed
 }
 
 func displayWorkerCardTitle(workerKind, workerIndex string) string {

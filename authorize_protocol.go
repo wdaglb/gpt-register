@@ -41,7 +41,10 @@ func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, 
 	var authorizeWG sync.WaitGroup
 	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, ui, cfg.authorizeWorkers, authorizeJobs, authorizeResults, &authorizeWG)
 
-	registerErr := runRegister(parent, cfg, mailClient, logger, store, ui, authorizeJobs)
+	registerErr := runRegisterUntilTargetSuccess(parent, cfg, mailClient, logger, store, ui, authorizeJobs)
+	if registerErr == nil {
+		logger.Printf("pipeline 注册阶段已达到目标数量=%d，等待授权阶段处理已入队账号", cfg.count)
+	}
 	close(authorizeJobs)
 	authorizeWG.Wait()
 	close(authorizeResults)

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -248,14 +249,11 @@ func TestNewRunTUIModelStartsAtHomeWithPreviewCards(t *testing.T) {
 	if model.phase != tuiPhaseHome {
 		t.Fatalf("expected home phase, got %q", model.phase)
 	}
-	if len(model.cardOrder) != 1+2+3 {
-		t.Fatalf("expected system + preview worker cards, got %d cards", len(model.cardOrder))
+	if len(model.cardOrder) != 1 {
+		t.Fatalf("expected only system log card, got %d cards", len(model.cardOrder))
 	}
-	if _, ok := model.logCards["worker-1"]; !ok {
-		t.Fatal("expected register worker placeholder")
-	}
-	if _, ok := model.logCards["auth-3"]; !ok {
-		t.Fatal("expected authorize worker placeholder")
+	if _, ok := model.logCards[tuiSystemCardID]; !ok {
+		t.Fatal("expected system log card")
 	}
 }
 
@@ -273,11 +271,8 @@ func TestSwitchToHomePageRebuildsPreviewCardsFromForm(t *testing.T) {
 	if model.phase != tuiPhaseHome {
 		t.Fatalf("expected home phase, got %q", model.phase)
 	}
-	if _, ok := model.logCards["auth-4"]; !ok {
-		t.Fatal("expected authorize preview card after switching home")
-	}
-	if _, ok := model.logCards["worker-1"]; ok {
-		t.Fatal("did not expect register preview card in authorize mode")
+	if len(model.cardOrder) != 1 {
+		t.Fatalf("expected home to keep only system card, got %d cards", len(model.cardOrder))
 	}
 }
 
@@ -316,8 +311,33 @@ func TestFooterHintAfterTaskFinished(t *testing.T) {
 	model.started = true
 	model.finished = true
 
-	if got := model.footerHint(); got != "任务已结束：c 配置，Enter/Ctrl+S 再次开始，Tab/左右切卡片，上下滚当前卡片。" {
+	if got := model.footerHint(); got != "任务已结束：Tab/左右切换按钮，Enter 执行，上下滚日志。" {
 		t.Fatalf("unexpected footer hint: %q", got)
+	}
+}
+
+func TestWorkerSummaryText(t *testing.T) {
+	model := newRunTUIModel(config{
+		mode:             modePipeline,
+		workers:          2,
+		authorizeWorkers: 3,
+	}, make(chan struct{}), make(chan config), nil)
+
+	if got := model.workerSummaryText(); got != "注册线程=2，授权线程=3" {
+		t.Fatalf("unexpected worker summary: %q", got)
+	}
+}
+
+func TestFooterViewContainsWorkerSummary(t *testing.T) {
+	model := newRunTUIModel(config{
+		mode:             modePipeline,
+		workers:          2,
+		authorizeWorkers: 3,
+	}, make(chan struct{}), make(chan config), nil)
+
+	rendered := model.footerView()
+	if !strings.Contains(rendered, "注册线程=2，授权线程=3") {
+		t.Fatalf("expected footer to contain worker summary, got %q", rendered)
 	}
 }
 
@@ -328,26 +348,25 @@ func TestUpdateHomePhaseAllowsConfigAfterTaskFinished(t *testing.T) {
 		authorizeWorkers: 1,
 	}, make(chan struct{}), make(chan config), nil)
 	model.finished = true
+	model.homeActionIndex = tuiHomeActionConfig
 
-	_ = model.updateHomePhase(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	_ = model.updateHomePhase(tea.KeyMsg{Type: tea.KeyEnter})
 
 	if model.phase != tuiPhaseConfig {
 		t.Fatalf("expected config phase, got %q", model.phase)
 	}
 }
 
-func TestUpdateHomePhaseTabCyclesFocusedCard(t *testing.T) {
+func TestUpdateHomePhaseTabCyclesHomeAction(t *testing.T) {
 	model := newRunTUIModel(config{
 		mode:             modePipeline,
 		workers:          1,
 		authorizeWorkers: 1,
 	}, make(chan struct{}), make(chan config), nil)
-	model.ensureFocusedLogCard()
-
-	initial := model.focusedCardID
+	initial := model.homeActionIndex
 	_ = model.updateHomePhase(tea.KeyMsg{Type: tea.KeyTab})
-	if model.focusedCardID == initial {
-		t.Fatalf("expected focused card to change, still %q", model.focusedCardID)
+	if model.homeActionIndex == initial {
+		t.Fatalf("expected home action to change, still %d", model.homeActionIndex)
 	}
 }
 
@@ -408,8 +427,8 @@ func TestScrollFocusedCardClampsOffset(t *testing.T) {
 	model.focusedCardID = "worker-1"
 
 	model.scrollFocusedCard(99)
-	if card.LogOffset != 2 {
-		t.Fatalf("expected clamped offset 2, got %d", card.LogOffset)
+	if card.LogOffset != 3 {
+		t.Fatalf("expected clamped offset 3, got %d", card.LogOffset)
 	}
 
 	model.scrollFocusedCard(-99)
@@ -431,24 +450,24 @@ func TestScrollFocusedCardSupportsSystemCard(t *testing.T) {
 	model.focusedCardID = tuiSystemCardID
 
 	model.scrollFocusedCard(99)
-	if card.LogOffset != 2 {
-		t.Fatalf("expected system card clamped offset 2, got %d", card.LogOffset)
+	if card.LogOffset != 4 {
+		t.Fatalf("expected system card clamped offset 4, got %d", card.LogOffset)
 	}
 }
 
 func TestClassifyTUILogLineForRegisterWorker(t *testing.T) {
 	cardID, title, subtitle, displayLine := classifyTUILogLine("[go-register] 2026/04/12 10:00:00 [worker-2][demo@example.com] 注册成功")
 
-	if cardID != "worker-2" {
-		t.Fatalf("expected cardID worker-2, got %q", cardID)
+	if cardID != tuiSystemCardID {
+		t.Fatalf("expected system card, got %q", cardID)
 	}
-	if title != "注册 Worker 2" {
-		t.Fatalf("expected title 注册 Worker 2, got %q", title)
+	if title != "系统日志" {
+		t.Fatalf("expected 系统日志 title, got %q", title)
 	}
-	if subtitle != "demo@example.com" {
-		t.Fatalf("expected subtitle demo@example.com, got %q", subtitle)
+	if subtitle != "汇总所有运行日志" {
+		t.Fatalf("expected system subtitle, got %q", subtitle)
 	}
-	if displayLine != "2026/04/12 10:00:00 注册成功" {
+	if displayLine != "2026/04/12 10:00:00 [worker-2][demo@example.com] 注册成功" {
 		t.Fatalf("unexpected display line: %q", displayLine)
 	}
 }
@@ -462,8 +481,8 @@ func TestClassifyTUILogLineForSystemCard(t *testing.T) {
 	if title != "系统日志" {
 		t.Fatalf("expected 系统日志 title, got %q", title)
 	}
-	if subtitle == "" {
-		t.Fatal("expected default subtitle")
+	if subtitle != "汇总所有运行日志" {
+		t.Fatalf("unexpected subtitle: %q", subtitle)
 	}
 	if displayLine != "2026/04/12 10:00:00 执行完成" {
 		t.Fatalf("unexpected display line: %q", displayLine)

@@ -37,6 +37,7 @@ type registrationAttemptResult struct {
 	Status   string
 	Reason   string
 	Err      error
+	Stop     bool
 }
 
 type registerSignInResponse struct {
@@ -120,6 +121,132 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 	return nil
 }
 
+// runRegisterUntilTargetSuccess 在 pipeline 模式下持续注册，直到注册成功数达到目标。
+// Why: pipeline 需要保证授权线程最终拿到足够多的已注册账号；如果只按固定尝试次数结束，注册刚达标时授权侧可能还没收尾完成。
+func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeJobs chan<- accountRecord) error {
+	if cfg.count <= 0 {
+		return fmt.Errorf("pipeline 模式下 count 必须大于 0")
+	}
+	if cfg.workers <= 0 {
+		return fmt.Errorf("pipeline 模式下 workers 必须大于 0")
+	}
+
+	workerCount := cfg.workers
+	if workerCount > cfg.count {
+		workerCount = cfg.count
+	}
+
+	jobs := make(chan int, workerCount)
+	results := make(chan registrationAttemptResult, workerCount)
+
+	var workers sync.WaitGroup
+	for workerID := 1; workerID <= workerCount; workerID++ {
+		workerID := workerID
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range jobs {
+				ui.RecordRegisterStart()
+				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
+				ui.RecordRegisterFinish(result.Status == "ok")
+				results <- result
+			}
+		}()
+	}
+
+	success := 0
+	fail := 0
+	inFlight := 0
+	nextJobID := 0
+	stopRequested := false
+	stopMessage := ""
+	var firstErr error
+
+	dispatchJob := func() {
+		nextJobID++
+		inFlight++
+		jobs <- nextJobID
+	}
+
+	for inFlight < workerCount && shouldDispatchPipelineRegisterJob(cfg.count, success, inFlight) {
+		dispatchJob()
+	}
+
+	for inFlight > 0 {
+		result := <-results
+		inFlight--
+
+		switch result.Status {
+		case "ok":
+			success++
+		default:
+			fail++
+			logger.Printf("注册失败账号=%s reason=%s err=%v", result.Email, result.Reason, result.Err)
+			if firstErr == nil && result.Err != nil {
+				firstErr = result.Err
+			}
+			if result.Stop && !stopRequested {
+				// Why: 邮箱池已空时继续补发注册任务只会产生相同失败，因此这里把它当作 pipeline 注册侧的停止信号。
+				stopRequested = true
+				stopMessage = "当前没有可用邮箱账号"
+				logger.Printf("pipeline 注册阶段停止补发新任务: %s", stopMessage)
+			}
+		}
+
+		if parent.Err() == nil && !stopRequested {
+			for inFlight < workerCount && shouldDispatchPipelineRegisterJob(cfg.count, success, inFlight) {
+				dispatchJob()
+			}
+		}
+	}
+
+	close(jobs)
+	workers.Wait()
+	close(results)
+
+	logger.Printf("注册任务结束: success=%d fail=%d output=%s", success, fail, cfg.accountsFile)
+	if success >= cfg.count {
+		return nil
+	}
+	if stopRequested {
+		if firstErr != nil {
+			return fmt.Errorf("注册提前停止: success=%d target=%d reason=%s: %w", success, cfg.count, stopMessage, firstErr)
+		}
+		return fmt.Errorf("注册提前停止: success=%d target=%d reason=%s", success, cfg.count, stopMessage)
+	}
+	if parent.Err() != nil {
+		if firstErr != nil {
+			return fmt.Errorf("注册未达到目标数量: success=%d target=%d: %w；最后错误=%v", success, cfg.count, parent.Err(), firstErr)
+		}
+		return fmt.Errorf("注册未达到目标数量: success=%d target=%d: %w", success, cfg.count, parent.Err())
+	}
+	if success == 0 && fail > 0 {
+		if firstErr != nil {
+			return fmt.Errorf("全部注册失败: %w", firstErr)
+		}
+		return fmt.Errorf("全部注册失败")
+	}
+	if firstErr != nil {
+		return fmt.Errorf("注册未达到目标数量: success=%d target=%d: %w", success, cfg.count, firstErr)
+	}
+	return fmt.Errorf("注册未达到目标数量: success=%d target=%d", success, cfg.count)
+}
+
+// shouldDispatchPipelineRegisterJob 判断 pipeline 是否需要继续补发新的注册任务。
+// Why: 只要“已成功数 + 正在执行数”仍小于目标值，就应该继续补位；这样既能保持并发，也能避免目标达标后继续超发注册。
+func shouldDispatchPipelineRegisterJob(targetSuccess, success, inFlight int) bool {
+	return success+inFlight < targetSuccess
+}
+
+// isNoAvailableLeaseError 判断租号失败是否属于“邮箱池已空”。
+// Why: 普通网络错误仍值得继续重试，但“当前没有可用邮箱账号”已经是明确的容量耗尽信号，应停止继续补注册。
+func isNoAvailableLeaseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "当前没有可用邮箱账号")
+}
+
 // runRegisterAttempt 负责单个邮箱租约的一次完整注册尝试。
 // 核心流程：租号 -> 纯协议注册 -> 立即写入 accounts.txt -> 成功标记 used / 失败归还租约。
 func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, authorizeJobs chan<- accountRecord, workerID int) registrationAttemptResult {
@@ -135,6 +262,10 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	if err != nil {
 		result.Err = fmt.Errorf("租用邮箱失败: %w", err)
 		result.Reason = "lease_account"
+		result.Stop = isNoAvailableLeaseError(err)
+		if result.Stop {
+			result.Reason = "lease_account_unavailable"
+		}
 		logger.Printf("[worker-%d] 租用邮箱失败: %v", workerID, err)
 		return result
 	}
@@ -167,10 +298,19 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 			}
 		}
 		if shouldKeepRegisterLeaseOnInvalidAuthStep(err) {
-			// Why: invalid_auth_step 出现在注册密码阶段时，说明该邮箱的注册会话已经走到不可复用状态，
-			// 继续归还到池里只会让后续 worker 反复租到同一个坏邮箱，因此这里直接标记为已使用并移出池子。
-			markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
-			logger.Printf("%s 注册密码阶段命中 invalid_auth_step，邮箱已移出池子", prefix)
+			registered, detectErr := client.detectRegisteredEmailAfterInvalidAuthStep(attemptCtx, cfg, lease.Email)
+			if detectErr != nil {
+				// Why: invalid_auth_step 本身不能稳定说明“邮箱已注册”；探测失败时宁可归还重试，也不要误把可用邮箱移出池子。
+				logger.Printf("%s 注册密码阶段命中 invalid_auth_step，但判定邮箱注册状态失败，先归还租约: %v", prefix, detectErr)
+				returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
+			} else if registered {
+				// Why: 只有额外确认该邮箱已进入登录密码阶段时，才能认定它已注册成功，不应继续回到池里重复注册。
+				markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
+				logger.Printf("%s 注册密码阶段命中 invalid_auth_step，且已确认邮箱已注册，邮箱已移出池子", prefix)
+			} else {
+				logger.Printf("%s 注册密码阶段命中 invalid_auth_step，但未确认邮箱已注册，归还租约等待后续重试", prefix)
+				returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
+			}
 		} else {
 			returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
 		}
@@ -519,13 +659,59 @@ func summarizeFlowReason(err error) string {
 }
 
 // shouldKeepRegisterLeaseOnInvalidAuthStep 判断注册失败是否需要把邮箱移出池子而不是归还。
-// Why: 只有“注册密码阶段 + invalid_auth_step”这一类失败会稳定复现且不可重试，必须避免邮箱被重新租出。
+// Why: 只有“注册密码阶段 + invalid_auth_step”才会进入额外探测；是否真正移出池子，还要再确认邮箱是否已注册。
 func shouldKeepRegisterLeaseOnInvalidAuthStep(err error) bool {
 	flowErr, ok := asFlowResultError(err)
 	if !ok || flowErr == nil || strings.TrimSpace(flowErr.reason) != "user_register" {
 		return false
 	}
 	return strings.Contains(flowErr.Error(), "invalid_auth_step")
+}
+
+// detectRegisteredEmailAfterInvalidAuthStep 在注册密码阶段命中 invalid_auth_step 后，用登录入口确认邮箱是否已注册。
+// Why: 同一个错误码既可能代表“邮箱已存在”，也可能只是当前注册状态机异常；只有看到登录链路进入密码页，才能把邮箱安全移出池子。
+func (c *protocolClient) detectRegisteredEmailAfterInvalidAuthStep(ctx context.Context, cfg config, email string) (bool, error) {
+	session := generateOAuthSession()
+	bootstrap, err := c.bootstrapLoginPage(ctx, session.AuthURL)
+	if err != nil {
+		return false, fmt.Errorf("初始化登录探测页失败: %w", err)
+	}
+
+	identifierResult, err := c.submitIdentifier(ctx, cfg, bootstrap, email)
+	if err != nil {
+		return false, fmt.Errorf("登录探测提交邮箱失败: %w", err)
+	}
+	return isRegisteredEmailFromIdentifierResult(identifierResult), nil
+}
+
+// isRegisteredEmailFromIdentifierResult 根据登录入口提交邮箱后的响应判断账号是否已注册。
+// Why: 已注册账号会继续推进到登录密码阶段；未进入密码页时，不能贸然认定该邮箱已存在。
+func isRegisteredEmailFromIdentifierResult(result *httpResult) bool {
+	if result == nil {
+		return false
+	}
+
+	step := parseAuthAPIEnvelope(result.Body)
+	if step.Page.Type == "login_password" {
+		return true
+	}
+
+	for _, candidate := range []string{
+		step.ContinueURL,
+		step.Page.Payload.URL,
+		result.FinalURL,
+		result.Location,
+	} {
+		lowerCandidate := strings.ToLower(strings.TrimSpace(candidate))
+		if lowerCandidate == "" {
+			continue
+		}
+		if strings.Contains(lowerCandidate, "/log-in/password") || strings.Contains(lowerCandidate, "/u/login/password") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // returnAccountWithCleanup 在主流程失败后归还邮箱租约。
