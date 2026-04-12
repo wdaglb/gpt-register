@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	sentinel "openai-sentinel-go"
+	sentinel "go-register/internal/sentinel"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"

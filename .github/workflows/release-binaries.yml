@@ -1,0 +1,124 @@
+name: release-binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive_ext: zip
+
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建并打包二进制
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          binary_name="go-register"
+          mkdir -p build dist
+
+          extension=""
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            extension=".exe"
+          fi
+
+          # Why: 这里固定关闭 CGO，确保主分支自动发布时所有目标平台都能跨平台稳定产出单文件二进制。
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o "build/${binary_name}${extension}" .
+
+          asset_name="${binary_name}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            (
+              cd build
+              zip -q "../dist/${asset_name}.zip" "${binary_name}${extension}"
+            )
+          else
+            tar -C build -czf "dist/${asset_name}.tar.gz" "${binary_name}${extension}"
+          fi
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: 发布 latest Release
+        if: github.ref == 'refs/heads/main'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          name: latest
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifacts: dist/*
+          body: |
+            自动构建于 main 分支最新提交。
+
+            可通过仓库内的 install.sh 自动下载并安装当前平台二进制。
+
+      - name: 发布版本 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          artifactErrorsFailBuild: true
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifacts: dist/*
+          body: |
+            自动构建于 tag `${{ github.ref_name }}`。
+
+            安装指定版本示例：
+            `curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh | GO_REGISTER_TAG=${{ github.ref_name }} bash`

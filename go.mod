@@ -10,7 +10,6 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/term v0.2.2
 	golang.org/x/net v0.48.0
-	openai-sentinel-go v0.0.0
 )
 
 require (
@@ -53,5 +52,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.48.2 // indirect
 )
-
-replace openai-sentinel-go => /Users/wanz/web/wwwroot/ai/gpt-register/openai-sentinel-go

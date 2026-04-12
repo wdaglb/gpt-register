@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO="${GITHUB_REPO:-wdaglb/gpt-register}"
+BINARY_NAME="${GO_REGISTER_BINARY_NAME:-go-register}"
+TAG="${GO_REGISTER_TAG:-latest}"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+WORK_DIR="${WORK_DIR:-$(pwd)}"
+TMP_DIR="$(mktemp -d)"
+
+log() {
+  printf '[install] %s\n' "$*"
+}
+
+warn() {
+  printf '[install][warn] %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[install][error] %s\n' "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  rm -rf "${TMP_DIR}"
+}
+
+trap cleanup EXIT
+
+resolve_platform() {
+  local os_name
+  local arch_name
+
+  os_name="$(uname -s)"
+  arch_name="$(uname -m)"
+
+  case "${os_name}" in
+    Linux) GOOS="linux" ;;
+    Darwin) GOOS="darwin" ;;
+    *)
+      fail "当前安装脚本仅支持 Linux / macOS，检测到系统: ${os_name}"
+      ;;
+  esac
+
+  case "${arch_name}" in
+    x86_64|amd64) GOARCH="amd64" ;;
+    arm64|aarch64) GOARCH="arm64" ;;
+    *)
+      fail "当前安装脚本暂不支持该架构: ${arch_name}"
+      ;;
+  esac
+
+  ARCHIVE_EXT="tar.gz"
+  ASSET_NAME="${BINARY_NAME}_${GOOS}_${GOARCH}.${ARCHIVE_EXT}"
+}
+
+resolve_download_url() {
+  # Why: 线上默认走 latest release，便于主分支每次自动发布后都能被安装脚本直接消费；
+  # 若用户指定具体 tag，则回退到固定版本下载链接。
+  if [[ "${TAG}" == "latest" ]]; then
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
+    return
+  fi
+
+  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET_NAME}"
+}
+
+download_asset() {
+  local target_file="${TMP_DIR}/${ASSET_NAME}"
+
+  log "下载二进制包: ${DOWNLOAD_URL}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 15 -o "${target_file}" "${DOWNLOAD_URL}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "${target_file}" "${DOWNLOAD_URL}"
+  else
+    fail "未找到 curl 或 wget，无法下载 GitHub Release 产物"
+  fi
+
+  ARCHIVE_PATH="${target_file}"
+}
+
+extract_binary() {
+  log "解压二进制包"
+  tar -xzf "${ARCHIVE_PATH}" -C "${TMP_DIR}"
+
+  EXTRACTED_BINARY="${TMP_DIR}/${BINARY_NAME}"
+  [[ -f "${EXTRACTED_BINARY}" ]] || fail "解压后未找到二进制文件: ${BINARY_NAME}"
+}
+
+install_binary() {
+  mkdir -p "${INSTALL_DIR}"
+  install -m 0755 "${EXTRACTED_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
+  log "二进制已安装到: ${INSTALL_DIR}/${BINARY_NAME}"
+
+  if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
+    warn "INSTALL_DIR 未加入 PATH，当前会话请使用完整路径运行"
+  fi
+}
+
+prepare_runtime_files() {
+  # Why: 二进制本身不带运行态数据；这里初始化最小目录结构，用户解压后即可直接按 README 命令运行。
+  mkdir -p "${WORK_DIR}/auth"
+  touch "${WORK_DIR}/accounts.txt"
+  touch "${WORK_DIR}/emails.txt"
+  touch "${WORK_DIR}/user.txt"
+  log "已初始化运行目录: ${WORK_DIR}"
+}
+
+print_next_steps() {
+  cat <<EOF
+
+[install] 安装完成。
+[install] 下一步建议：
+1. 编辑 ${WORK_DIR}/emails.txt，填入邮箱池数据，格式：
+   email@example.com----password----client_id----refresh_token
+2. 启动内置 web_mail：
+   ${INSTALL_DIR}/${BINARY_NAME} -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ${WORK_DIR}/emails.txt
+3. 启动主程序（TUI 推荐）：
+   ${INSTALL_DIR}/${BINARY_NAME} -accounts-file ${WORK_DIR}/accounts.txt -proxy http://127.0.0.1:7890 -web-mail-url http://127.0.0.1:8030
+
+[install] 可选环境变量：
+- GITHUB_REPO=${REPO}
+- GO_REGISTER_TAG=${TAG}
+- INSTALL_DIR=${INSTALL_DIR}
+- WORK_DIR=${WORK_DIR}
+EOF
+}
+
+main() {
+  log "开始安装 ${BINARY_NAME}"
+  resolve_platform
+  resolve_download_url
+  download_asset
+  extract_binary
+  install_binary
+  prepare_runtime_files
+  print_next_steps
+}
+
+main "$@"

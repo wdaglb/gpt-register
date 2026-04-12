@@ -19,6 +19,49 @@
   - `login`：单账号登录调试
 - 使用线程锁 + 文件锁保护 `accounts.txt`，避免并发写乱
 
+## 二进制安装（GitHub Release）
+
+当前仓库支持两种自动发布：
+
+- `main` 分支 push：自动更新 `latest` Release
+- 推送 `v*` tag：自动发布同名版本 Release，例如 `v1.0.0`
+
+自动构建以下平台二进制：
+
+- Linux amd64
+- Linux arm64
+- macOS amd64
+- macOS arm64
+- Windows amd64
+
+Unix 环境可直接使用仓库内的 `install.sh` 下载最新 Release 并初始化运行目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh | bash
+```
+
+安装指定 tag 版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh | GO_REGISTER_TAG=v1.0.0 bash
+```
+
+可选环境变量：
+
+- `GO_REGISTER_TAG`：指定下载的 Release tag，默认 `latest`
+- `INSTALL_DIR`：二进制安装目录，默认 `$HOME/.local/bin`
+- `WORK_DIR`：运行目录，默认执行脚本时的当前目录
+
+安装完成后，会自动创建：
+
+- `auth/`
+- `accounts.txt`
+- `emails.txt`
+- `user.txt`
+
+> 下面的二进制运行示例默认你已经执行过 `install.sh`，并且 `go-register` 已在 `PATH` 中。  
+> 如果 `~/.local/bin` 没加入 `PATH`，请把命令里的 `go-register` 替换成 `~/.local/bin/go-register`。
+
 ## 运行前准备
 
 1. 准备邮箱池 txt 数据库 `emails.txt`，基础格式如下：
@@ -42,7 +85,7 @@ email@example.com----password----client_id----refresh_token----used_at:2026-04-1
 2. 启动当前仓库内置的 `web_mail` 服务，例如：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
@@ -63,7 +106,7 @@ auth-cdn.oaistatic.com
 在交互终端里直接运行：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -accounts-file accounts.txt \
   -proxy http://127.0.0.1:7890 \
   -web-mail-url http://127.0.0.1:8030
@@ -158,11 +201,11 @@ TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
 该模式会在当前仓库内启动一个兼容历史 Python 版接口的邮箱池 HTTP 服务：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
-  -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt \
+  -web-mail-emails-file ./emails.txt \
   -mail-api-base https://www.appleemail.top \
   -web-mail-lease-timeout-seconds 600
 ```
@@ -170,10 +213,10 @@ TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
 只同步邮箱文件后退出：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode webmail \
   -web-mail-sync-only \
-  -web-mail-emails-file /Users/wanz/web/my/gpt/go-register/emails.txt
+  -web-mail-emails-file ./emails.txt
 ```
 
 提供的 HTTP 接口：
@@ -240,7 +283,7 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 只负责注册，并在账号注册成功后立即把账号写入 `accounts.txt`：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode register \
   -accounts-file accounts.txt \
   -proxy http://127.0.0.1:7890 \
@@ -260,7 +303,7 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 从 `accounts.txt` 中筛出“已注册成功但未授权成功”的账号，批量执行授权：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode authorize \
   -accounts-file accounts.txt \
   -proxy http://127.0.0.1:7890 \
@@ -283,7 +326,7 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 注册线程和授权线程独立运行，但共享同一个 `accounts.txt`：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode pipeline \
   -accounts-file accounts.txt \
   -proxy http://127.0.0.1:7890 \
@@ -305,7 +348,7 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 保留历史 `login` 模式，便于单账号调试 OAuth 登录闭环：
 
 ```bash
-/Users/wanz/sdk/go1.26.1/bin/go run . \
+go-register \
   -mode login \
   -email your_openai_account@example.com \
   -password 'YourOpenAIPassword!' \
