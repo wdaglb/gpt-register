@@ -194,7 +194,7 @@ write_default_config() {
   local config_path="${WORK_DIR}/.config.json"
 
   # Why: 即便服务场景主要通过 systemd 环境文件驱动，仍然生成一份 TUI 默认配置，
-  # 方便用户后续在同一目录下手动运行程序或排查配置差异。
+  # 方便用户后续在同一目录下手动运行程序或排查配置差异；若文件已存在则保留用户已有配置。
   write_file_if_missing "${config_path}" "$(cat <<EOF
 {
   "mode": "pipeline",

@@ -133,8 +133,7 @@ prepare_runtime_files() {
 write_default_config() {
   local config_path="${WORK_DIR}/.config.json"
 
-  # Why: 安装脚本直接生成一份可运行的默认配置，用户首次进入 TUI 时可以立刻看到完整参数，
-  # 同时通过“已存在则跳过”避免重装时覆盖用户手工修改过的配置。
+  # Why: 默认配置只在首次安装时生成，避免重装时覆盖用户已经手工调过的运行参数。
   write_file_if_missing "${config_path}" "$(cat <<EOF
 {
   "mode": "pipeline",

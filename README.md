@@ -60,6 +60,12 @@ curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh
 - `user.txt`
 - `.config.json`
 
+默认覆盖安装行为：
+
+- 重新执行 `install.sh` 时会覆盖 `go-register` 二进制
+- 不会覆盖已存在的 `./.config.json`
+- 不会清空 `accounts.txt`、`emails.txt`、`user.txt` 与 `auth/` 目录中的已有数据
+
 默认安装后目录结构如下：
 
 ```text
@@ -97,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install-sy
 
 - 二进制与运行文件安装到 `~/gpt-register`
 - 自动创建 `accounts.txt`、`emails.txt`、`user.txt`、`auth/`
-- 自动生成 `~/gpt-register/.config.json`
+- 首次安装时自动生成 `~/gpt-register/.config.json`，已存在时不覆盖
 - 自动生成 `/etc/default/go-register-webmail`
 - 自动生成 `/etc/default/gpt-register`
 - 自动执行 `systemctl enable --now`
@@ -219,6 +225,38 @@ chatgpt.com
 auth.openai.com
 sentinel.openai.com
 auth-cdn.oaistatic.com
+```
+
+代理参数支持会话占位符：
+
+- `{}`：默认替换为 12 位随机字母数字
+- `{6}`：替换为 6 位随机字母数字
+- `{8}`：替换为 8 位随机字母数字
+
+说明：
+
+- 占位符会在**单次注册 / 授权流程开始时**替换
+- 同一流程内会复用同一个随机值，不会每个请求都变
+- 同一代理字符串里，相同长度占位符会复用同一个值
+
+示例：
+
+```bash
+./go-register \
+  -proxy 'http://user-{}:pass@proxy.example.com:8888'
+```
+
+可能会在单次流程里解析成：
+
+```text
+http://user-a8K3mP2xQ9Ld:pass@proxy.example.com:8888
+```
+
+指定长度示例：
+
+```bash
+./go-register \
+  -proxy 'http://user-{6}:pass-{6}@proxy.example.com:8888'
 ```
 
 ### 4. 启动主程序
@@ -509,7 +547,7 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 | `-password` | `login` 模式账号密码；为空时从 `user-file` 读取 |
 | `-user-file` | `login` 模式账号文件，支持两行 `email/password` 或单行 `email----password` |
 | `-auth-dir` | 授权文件输出目录，默认 `auth` |
-| `-proxy` | HTTP / HTTPS 代理地址 |
+| `-proxy` | HTTP / HTTPS 代理地址；支持 `{}` 或 `{数字}` 会话占位符，例如 `http://user-{6}:pass@proxy.example.com:8888` |
 | `-mailbox` | 验证码轮询优先邮箱目录，默认 `Junk` |
 | `-count` | `register` / `pipeline` 模式的注册数量 |
 | `-workers` | `register` 模式注册并发数，或 `authorize` 模式授权并发数 |
