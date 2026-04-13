@@ -40,39 +40,13 @@ func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *we
 	return runAuthorizeRecords(parent, cfg, mailClient, logger, store, ui, pending, cfg.workers)
 }
 
-// runPipeline 同时运行注册 worker 和授权 worker。
-// Why: 注册成功后立即把账号放入统一状态文件，再交给独立授权 worker 消费，可以避免串行等待放大整体耗时。
+// runPipeline 在单个 worker 内串行完成“注册成功即授权”的闭环。
+// Why: 用户要求注册和授权必须复用同一条指纹/IP 链路，因此不能再把同一账号拆给独立授权 worker。
 func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
-	authorizeJobs := make(chan accountRecord, maxInt(cfg.authorizeWorkers*2, 1))
-	authorizeResults := make(chan authorizationAttemptResult, maxInt(cfg.authorizeWorkers*2, 1))
-	summaryCh := make(chan authorizationSummary, 1)
-
-	var authorizeWG sync.WaitGroup
-	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, ui, cfg.authorizeWorkers, authorizeJobs, authorizeResults, &authorizeWG)
-	go func() {
-		summaryCh <- collectAuthorizationResults(authorizeResults, logger, "pipeline ")
-	}()
-
-	registerErr := runRegisterUntilTargetSuccess(parent, cfg, mailClient, logger, store, ui, authorizeJobs)
-	if registerErr == nil {
-		logger.Printf("pipeline 注册阶段已达到目标数量=%d，等待授权阶段处理已入队账号", cfg.count)
+	if cfg.authorizeWorkers > 1 {
+		logger.Printf("pipeline 模式已切换为单链路串行授权，authorize-workers=%d 当前仅用于兼容旧配置，不再拆分账号内授权线程", cfg.authorizeWorkers)
 	}
-	close(authorizeJobs)
-	authorizeWG.Wait()
-	close(authorizeResults)
-	summary := <-summaryCh
-
-	logger.Printf("pipeline 授权阶段结束: success=%d fail=%d", summary.success, summary.fail)
-	if registerErr != nil && summary.firstErr != nil {
-		return fmt.Errorf("注册阶段失败: %w；授权阶段失败: %v", registerErr, summary.firstErr)
-	}
-	if registerErr != nil {
-		return registerErr
-	}
-	if summary.firstErr != nil {
-		return summary.firstErr
-	}
-	return nil
+	return runRegisterUntilTargetSuccess(parent, cfg, mailClient, logger, store, ui, true)
 }
 
 func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, records []accountRecord, workerCount int) error {
@@ -149,19 +123,37 @@ func runAuthorizeAttempt(parent context.Context, cfg config, mailClient *webMail
 
 	prefix := fmt.Sprintf("[auth-%d][%s]", workerID, record.Email)
 	logger.Printf("%s 开始授权", prefix)
+	return authorizeAccountWithClient(attemptCtx, cfg, mailClient, logger, store, record, nil, prefix)
+}
 
-	result, err := loginWithProtocol(attemptCtx, cfg, loginAccount{
-		email:    record.Email,
-		password: record.Password,
-	}, mailClient, logger)
+// authorizeAccountWithClient 统一执行授权并回写 oauth 状态；当客户端非空时复用现有浏览器链路。
+// Why: pipeline 需要注册后立刻沿用同一 protocolClient 继续 OAuth，而独立授权模式仍可以按旧路径新建客户端。
+func authorizeAccountWithClient(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, record accountRecord, client *protocolClient, prefix string) authorizationAttemptResult {
+	var (
+		result *protocolLoginResult
+		err    error
+	)
+	if client == nil {
+		result, err = loginWithProtocol(parent, cfg, loginAccount{
+			email:    record.Email,
+			password: record.Password,
+		}, mailClient, logger)
+	} else {
+		result, err = loginWithProtocolClient(parent, cfg, loginAccount{
+			email:    record.Email,
+			password: record.Password,
+		}, mailClient, logger, client)
+	}
 	if err != nil {
 		reason := summarizeFlowReason(err)
 		status := "oauth=fail:" + reason
-		if _, writeErr := store.upsertOAuthResult(record.Email, record.Password, status, time.Now(), ""); writeErr != nil {
-			return authorizationAttemptResult{
-				Email:       record.Email,
-				OAuthStatus: status,
-				Err:         fmt.Errorf("授权失败: %v；回写 accounts 失败: %w", err, writeErr),
+		if store != nil {
+			if _, writeErr := store.upsertOAuthResult(record.Email, record.Password, status, time.Now(), ""); writeErr != nil {
+				return authorizationAttemptResult{
+					Email:       record.Email,
+					OAuthStatus: status,
+					Err:         fmt.Errorf("授权失败: %v；回写 accounts 失败: %w", err, writeErr),
+				}
 			}
 		}
 		logger.Printf("%s 授权失败: %v", prefix, err)
@@ -172,11 +164,13 @@ func runAuthorizeAttempt(parent context.Context, cfg config, mailClient *webMail
 		}
 	}
 
-	if _, err := store.upsertOAuthResult(record.Email, record.Password, "oauth=ok", time.Now(), result.AuthFilePath); err != nil {
-		return authorizationAttemptResult{
-			Email:       record.Email,
-			OAuthStatus: "oauth=ok",
-			Err:         fmt.Errorf("授权成功但回写 accounts 失败: %w", err),
+	if store != nil {
+		if _, err := store.upsertOAuthResult(record.Email, record.Password, "oauth=ok", time.Now(), result.AuthFilePath); err != nil {
+			return authorizationAttemptResult{
+				Email:       record.Email,
+				OAuthStatus: "oauth=ok",
+				Err:         fmt.Errorf("授权成功但回写 accounts 失败: %w", err),
+			}
 		}
 	}
 

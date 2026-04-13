@@ -19,6 +19,7 @@ import (
 	"time"
 
 	sentinel "go-register/internal/sentinel"
+	"go-register/utils"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -32,13 +33,11 @@ const (
 	authLoginIdentifier   = auth0BaseURL + "/u/login/identifier?state=%s"
 	authLoginPassword     = auth0BaseURL + "/u/login/password?state=%s"
 	auth0AcceptHeader     = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-	defaultOAuthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+	defaultOAuthUserAgent = chromeMacUserAgent
 	oauthAuthorizeURL     = "https://auth.openai.com/oauth/authorize"
 	oauthTokenURL         = "https://auth.openai.com/oauth/token"
 	oauthClientID         = "app_EMoamEEZ73f0CkXaXp7hrann"
 	oauthRedirectURI      = "http://localhost:1455/auth/callback"
-	chromeSecCHUA         = `"Google Chrome";v="135", "Chromium";v="135", "Not.A/Brand";v="24"`
-	chromeSecCHUAFull     = `"Google Chrome";v="135.0.0.0", "Chromium";v="135.0.0.0", "Not.A/Brand";v="24.0.0.0"`
 )
 
 var (
@@ -71,6 +70,9 @@ type flowResultError struct {
 type protocolClient struct {
 	httpClient tls_client.HttpClient
 	userAgent  string
+	persona    browserPersona
+	deviceID   string
+	proxyURL   string
 	logf       func(string, ...any)
 }
 
@@ -181,11 +183,18 @@ type htmlForm struct {
 // loginWithProtocol 执行已有账号的纯协议 OAuth 登录闭环。
 // 核心流程：初始化前端会话 -> 提交邮箱/密码 -> 处理邮箱 OTP -> 交换 token -> 生成本地 auth 文件。
 func loginWithProtocol(parent context.Context, cfg config, account loginAccount, mailClient *webMailClient, logger *log.Logger) (*protocolLoginResult, error) {
+	cfg.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
 	httpClient, err := newProtocolClient(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
 
+	return loginWithProtocolClient(parent, cfg, account, mailClient, logger, httpClient)
+}
+
+// loginWithProtocolClient 在调用方已经持有协议客户端时复用同一会话完成 OAuth。
+// Why: pipeline 模式要求注册与授权复用同一条浏览器链路，不能在注册成功后再新建一套客户端和指纹。
+func loginWithProtocolClient(parent context.Context, cfg config, account loginAccount, mailClient *webMailClient, logger *log.Logger, httpClient *protocolClient) (*protocolLoginResult, error) {
 	session := generateOAuthSession()
 	logger.Printf("已生成 OAuth state: %s", trimForLog(session.State))
 
@@ -214,6 +223,7 @@ func loginWithProtocol(parent context.Context, cfg config, account loginAccount,
 // Why: OpenAI 当前链路对 TLS 指纹、Cookie 连续性都较敏感，因此这里显式模拟同一浏览器会话。
 func newProtocolClient(cfg config, logger *log.Logger) (*protocolClient, error) {
 	jar := tls_client.NewCookieJar()
+	persona := newBrowserPersona()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(int(cfg.requestTimeout.Seconds())),
 		tls_client.WithClientProfile(profiles.Chrome_133),
@@ -231,7 +241,10 @@ func newProtocolClient(cfg config, logger *log.Logger) (*protocolClient, error) 
 
 	return &protocolClient{
 		httpClient: client,
-		userAgent:  defaultOAuthUserAgent,
+		userAgent:  persona.UserAgent,
+		persona:    persona,
+		deviceID:   utils.RandomUUID(),
+		proxyURL:   strings.TrimSpace(cfg.proxy),
 		logf: func(format string, args ...any) {
 			if logger != nil {
 				logger.Printf(format, args...)
@@ -469,8 +482,8 @@ func randomURLToken(byteLength int) string {
 
 // buildSentinelHeader 为指定 flow 生成 OpenAI-Sentinel-Token 请求头。
 // Why: 当前登录页和密码页都由 Sentinel SDK 动态保护，缺少这个头通常会直接返回前端状态机错误。
-func buildSentinelHeader(ctx context.Context, cfg config, bootstrap *bootstrapPage, flow, referer string) (map[string]string, error) {
-	session, err := newSentinelSession(cfg, bootstrap)
+func buildSentinelHeader(ctx context.Context, cfg config, client *protocolClient, bootstrap *bootstrapPage, flow, referer string) (map[string]string, error) {
+	session, err := newSentinelSession(cfg, client, bootstrap)
 	if err != nil {
 		return nil, err
 	}
@@ -497,29 +510,58 @@ func buildSentinelHeader(ctx context.Context, cfg config, bootstrap *bootstrapPa
 
 // newSentinelSession 构造纯 Go Sentinel 求解所需的浏览器样本。
 // Why: DeviceID、语言和屏幕信息要尽量与登录页初始化阶段保持一致，减少风控侧看到的前后指纹漂移。
-func newSentinelSession(cfg config, bootstrap *bootstrapPage) (*sentinel.Session, error) {
+func newSentinelSession(cfg config, client *protocolClient, bootstrap *bootstrapPage) (*sentinel.Session, error) {
 	transport := &stdhttp.Transport{}
-	if strings.TrimSpace(cfg.proxy) != "" {
-		proxyURL, err := url.Parse(cfg.proxy)
+	proxyURLText := strings.TrimSpace(cfg.proxy)
+	if client != nil && strings.TrimSpace(client.proxyURL) != "" {
+		proxyURLText = strings.TrimSpace(client.proxyURL)
+	}
+	if proxyURLText != "" {
+		proxyURL, err := url.Parse(proxyURLText)
 		if err != nil {
 			return nil, fmt.Errorf("解析 Sentinel 代理失败: %w", err)
 		}
 		transport.Proxy = stdhttp.ProxyURL(proxyURL)
 	}
 
+	persona := newBrowserPersona()
+	deviceID := ""
+	if client != nil {
+		persona = client.persona
+		deviceID = strings.TrimSpace(client.deviceID)
+	}
+	if bootstrap != nil && strings.TrimSpace(bootstrap.DeviceID) != "" {
+		deviceID = strings.TrimSpace(bootstrap.DeviceID)
+	}
+	if deviceID == "" {
+		deviceID = utils.RandomUUID()
+	}
+
 	return &sentinel.Session{
 		Client:              &stdhttp.Client{Timeout: cfg.requestTimeout, Transport: transport},
-		DeviceID:            bootstrap.DeviceID,
-		UserAgent:           defaultOAuthUserAgent,
-		ScreenWidth:         1512,
-		ScreenHeight:        982,
-		HeapLimit:           4294705152,
-		HardwareConcurrency: 8,
-		Language:            "zh-CN",
-		LanguagesJoin:       "zh-CN,en-US",
+		DeviceID:            deviceID,
+		UserAgent:           persona.UserAgent,
+		ScreenWidth:         persona.ScreenWidth,
+		ScreenHeight:        persona.ScreenHeight,
+		HeapLimit:           persona.HeapLimit,
+		HardwareConcurrency: persona.HardwareConcurrency,
+		Language:            persona.Language,
+		LanguagesJoin:       persona.LanguagesJoin,
 		Persona: sentinel.Persona{
-			Platform:              "MacIntel",
-			Vendor:                "Google Inc.",
+			Platform:              persona.PlatformJS,
+			Vendor:                persona.Vendor,
+			TimezoneOffsetMin:     persona.TimezoneOffsetMin,
+			SessionID:             persona.SessionID,
+			TimeOrigin:            persona.TimeOrigin,
+			WindowFlags:           persona.WindowFlags,
+			WindowFlagsSet:        true,
+			EntropyA:              persona.EntropyA,
+			EntropyB:              persona.EntropyB,
+			NavigatorProbe:        persona.NavigatorProbe,
+			DocumentProbe:         persona.DocumentProbe,
+			WindowProbe:           persona.WindowProbe,
+			PerformanceNow:        persona.PerformanceNow,
+			RequirementsElapsed:   persona.RequirementsElapsed,
 			RequirementsScriptURL: "https://sentinel.openai.com/backend-api/sentinel/sdk.js",
 		},
 	}, nil
@@ -1123,8 +1165,12 @@ func (c *protocolClient) bootstrapLoginPage(ctx context.Context, authURL string)
 
 	deviceID := extractDeviceID(result.Body)
 	if deviceID == "" {
-		deviceID = randomURLToken(16)
+		deviceID = strings.TrimSpace(c.deviceID)
 	}
+	if deviceID == "" {
+		deviceID = utils.RandomUUID()
+	}
+	c.deviceID = deviceID
 
 	page := &bootstrapPage{
 		FinalURL:             result.FinalURL,
@@ -1158,7 +1204,7 @@ func (c *protocolClient) openPage(ctx context.Context, pageURL, referer string) 
 
 // submitIdentifier 提交邮箱，推进到密码页。
 func (c *protocolClient) submitIdentifier(ctx context.Context, cfg config, bootstrap *bootstrapPage, email string) (*httpResult, error) {
-	sentinelHeader, err := buildSentinelHeader(ctx, cfg, bootstrap, "authorize_continue", bootstrap.FinalURL)
+	sentinelHeader, err := buildSentinelHeader(ctx, cfg, c, bootstrap, "authorize_continue", bootstrap.FinalURL)
 	if err != nil {
 		return nil, fmt.Errorf("生成 authorize_continue sentinel 失败: %w", err)
 	}
@@ -1189,7 +1235,7 @@ func (c *protocolClient) submitIdentifier(ctx context.Context, cfg config, boots
 
 // submitPassword 提交密码，推进到 OTP 或 consent 下一步。
 func (c *protocolClient) submitPassword(ctx context.Context, cfg config, bootstrap *bootstrapPage, password string) (*httpResult, error) {
-	sentinelHeader, err := buildSentinelHeader(ctx, cfg, bootstrap, "password_verify", "https://auth.openai.com/log-in/password")
+	sentinelHeader, err := buildSentinelHeader(ctx, cfg, c, bootstrap, "password_verify", "https://auth.openai.com/log-in/password")
 	if err != nil {
 		return nil, fmt.Errorf("生成 password_verify sentinel 失败: %w", err)
 	}
@@ -1437,12 +1483,12 @@ func (c *protocolClient) doRequest(ctx context.Context, options requestOptions) 
 	if err != nil {
 		return nil, err
 	}
-	req.Header = buildBrowserHeaders(options, c.userAgent)
+	req.Header = buildBrowserHeaders(options, c.persona)
 
 	c.httpClient.SetFollowRedirect(options.AllowRedirect)
-	requestLabel := "OpenAI请求 " + formatHTTPRequestLabel(options.Method, options.URL)
+	requestLabel := "OpenAI请求 " + utils.FormatHTTPRequestLabel(options.Method, options.URL)
 	var resp *http.Response
-	err = runWithWaitLog(ctx, waitLogFunc(c.logf, requestLabel), func() error {
+	err = utils.RunWithWaitLog(ctx, utils.WaitLogFunc(c.logf, requestLabel), func() error {
 		var requestErr error
 		resp, requestErr = c.httpClient.Do(req)
 		return requestErr
@@ -1470,20 +1516,22 @@ func (c *protocolClient) doRequest(ctx context.Context, options requestOptions) 
 
 // buildBrowserHeaders 根据请求类型组装尽量贴近真实浏览器的头部集合。
 // Why: 这里除了值本身，还会显式控制 header 顺序，目的是减少 TLS 指纹之外的浏览器画像偏差。
-func buildBrowserHeaders(options requestOptions, userAgent string) http.Header {
+func buildBrowserHeaders(options requestOptions, persona browserPersona) http.Header {
 	headers := http.Header{
-		"user-agent":                  {userAgent},
-		"accept-language":             {"zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"},
-		"sec-ch-ua":                   {chromeSecCHUA},
-		"sec-ch-ua-full-version-list": {chromeSecCHUAFull},
-		"sec-ch-ua-mobile":            {"?0"},
-		"sec-ch-ua-platform":          {`"macOS"`},
-		"sec-ch-ua-platform-version":  {`"15.3.1"`},
-		"sec-ch-ua-arch":              {`"x86"`},
-		"sec-ch-ua-bitness":           {`"64"`},
-		"sec-ch-ua-model":             {`""`},
-		"priority":                    {"u=0, i"},
-		http.PHeaderOrderKey:          {":method", ":authority", ":scheme", ":path"},
+		"user-agent":         {persona.UserAgent},
+		"accept-language":    {persona.AcceptLanguage},
+		"priority":           {"u=0, i"},
+		http.PHeaderOrderKey: {":method", ":authority", ":scheme", ":path"},
+	}
+	if persona.SendClientHints {
+		headers["sec-ch-ua"] = []string{persona.SecCHUA}
+		headers["sec-ch-ua-full-version-list"] = []string{persona.SecCHUAFullVersion}
+		headers["sec-ch-ua-mobile"] = []string{"?0"}
+		headers["sec-ch-ua-platform"] = []string{fmt.Sprintf("%q", persona.PlatformHeader)}
+		headers["sec-ch-ua-platform-version"] = []string{fmt.Sprintf("%q", persona.PlatformVersion)}
+		headers["sec-ch-ua-arch"] = []string{fmt.Sprintf("%q", persona.Architecture)}
+		headers["sec-ch-ua-bitness"] = []string{fmt.Sprintf("%q", persona.Bitness)}
+		headers["sec-ch-ua-model"] = []string{`""`}
 	}
 	if options.Accept != "" {
 		headers["accept"] = []string{options.Accept}
@@ -1500,13 +1548,18 @@ func buildBrowserHeaders(options requestOptions, userAgent string) http.Header {
 	for key, value := range options.ExtraHeaders {
 		headers[key] = []string{value}
 	}
-	applyBrowserRequestProfile(headers, options.Profile)
+	applyBrowserRequestProfile(headers, options.Profile, persona)
 	return headers
 }
 
 // applyBrowserRequestProfile 为不同类型请求补齐 fetch/navigation 特征头。
 // Why: 页面导航、XHR API 和 token 交换在浏览器里天然长得不一样，把它们混用会明显增加被风控识别的概率。
-func applyBrowserRequestProfile(headers http.Header, profile requestProfile) {
+func applyBrowserRequestProfile(headers http.Header, profile requestProfile, persona browserPersona) {
+	clientHintOrder := []string{}
+	if persona.SendClientHints {
+		clientHintOrder = []string{"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform"}
+	}
+
 	switch profile {
 	case profileNavigate:
 		headers["cache-control"] = []string{"max-age=0"}
@@ -1516,7 +1569,7 @@ func applyBrowserRequestProfile(headers http.Header, profile requestProfile) {
 		headers["sec-fetch-user"] = []string{"?1"}
 		headers["upgrade-insecure-requests"] = []string{"1"}
 		headers["accept-encoding"] = []string{"gzip, deflate, br, zstd"}
-		headers[http.HeaderOrderKey] = []string{"cache-control", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "upgrade-insecure-requests", "user-agent", "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "accept-encoding", "accept-language", "priority"}
+		headers[http.HeaderOrderKey] = append([]string{"cache-control"}, append(clientHintOrder, "upgrade-insecure-requests", "user-agent", "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "accept-encoding", "accept-language", "priority")...)
 	case profileForm:
 		headers["cache-control"] = []string{"max-age=0"}
 		headers["sec-fetch-dest"] = []string{"document"}
@@ -1525,18 +1578,36 @@ func applyBrowserRequestProfile(headers http.Header, profile requestProfile) {
 		headers["sec-fetch-user"] = []string{"?1"}
 		headers["upgrade-insecure-requests"] = []string{"1"}
 		headers["accept-encoding"] = []string{"gzip, deflate, br, zstd"}
-		headers[http.HeaderOrderKey] = []string{"cache-control", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "origin", "content-type", "upgrade-insecure-requests", "user-agent", "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority"}
+		headers[http.HeaderOrderKey] = append([]string{"cache-control"}, append(clientHintOrder, "origin", "content-type", "upgrade-insecure-requests", "user-agent", "accept", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority")...)
 	case profileAPI:
 		headers["sec-fetch-dest"] = []string{"empty"}
 		headers["sec-fetch-mode"] = []string{"cors"}
 		headers["sec-fetch-site"] = []string{"same-origin"}
 		headers["accept-encoding"] = []string{"gzip, deflate, br, zstd"}
-		headers[http.HeaderOrderKey] = []string{"sec-ch-ua-platform", "user-agent", "sec-ch-ua", "content-type", "sec-ch-ua-mobile", "accept", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority"}
+		headers[http.HeaderOrderKey] = []string{"user-agent"}
+		if persona.SendClientHints {
+			headers[http.HeaderOrderKey] = append([]string{"sec-ch-ua-platform"}, headers[http.HeaderOrderKey]...)
+		}
+		if persona.SendClientHints {
+			headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "sec-ch-ua", "content-type", "sec-ch-ua-mobile")
+		} else {
+			headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "content-type")
+		}
+		headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "accept", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority")
 	case profileToken:
 		headers["sec-fetch-dest"] = []string{"empty"}
 		headers["sec-fetch-mode"] = []string{"cors"}
 		headers["sec-fetch-site"] = []string{"same-site"}
 		headers["accept-encoding"] = []string{"gzip, deflate, br, zstd"}
-		headers[http.HeaderOrderKey] = []string{"sec-ch-ua-platform", "user-agent", "sec-ch-ua", "content-type", "sec-ch-ua-mobile", "accept", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority"}
+		headers[http.HeaderOrderKey] = []string{"user-agent"}
+		if persona.SendClientHints {
+			headers[http.HeaderOrderKey] = append([]string{"sec-ch-ua-platform"}, headers[http.HeaderOrderKey]...)
+		}
+		if persona.SendClientHints {
+			headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "sec-ch-ua", "content-type", "sec-ch-ua-mobile")
+		} else {
+			headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "content-type")
+		}
+		headers[http.HeaderOrderKey] = append(headers[http.HeaderOrderKey], "accept", "origin", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "priority")
 	}
 }

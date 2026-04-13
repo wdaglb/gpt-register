@@ -651,7 +651,7 @@ func (model *runTUIModel) configView() string {
 		model.renderConfigRow(tuiFocusMailbox, "邮箱目录", model.mailboxInput.View()),
 		model.renderConfigRow(tuiFocusCount, "注册数量", model.countInput.View()+" "+tuiMutedStyle.Render("仅注册 / 注册+授权 生效")),
 		model.renderConfigRow(tuiFocusWorkers, "并发数量", model.workersInput.View()+" "+tuiMutedStyle.Render("仅注册 / 仅授权 生效")),
-		model.renderConfigRow(tuiFocusAuthorizeWorkers, "授权并发", model.authorizeWorkersInput.View()+" "+tuiMutedStyle.Render("注册+授权 生效")),
+		model.renderConfigRow(tuiFocusAuthorizeWorkers, "授权并发", model.authorizeWorkersInput.View()+" "+tuiMutedStyle.Render("兼容旧配置保留；当前单链路模式已忽略")),
 		model.renderConfigRow(tuiFocusTimeout, "整体超时", model.timeoutInput.View()),
 		model.renderConfigRow(tuiFocusOTPTimeout, "验证码超时", model.otpTimeoutInput.View()),
 		model.renderConfigRow(tuiFocusPollInterval, "轮询间隔", model.pollIntervalInput.View()),
@@ -1666,7 +1666,7 @@ func workerCardLayoutForMode(mode runMode, workers int, authorizeWorkers int) (i
 	case modeAuthorize:
 		return 0, maxInt(workers, 1)
 	case modePipeline:
-		return maxInt(workers, 1), maxInt(authorizeWorkers, 1)
+		return maxInt(workers, 1), 0
 	default:
 		return 0, 0
 	}
@@ -1691,7 +1691,7 @@ func displayModeConfigHint(mode runMode) string {
 	case modeAuthorize:
 		return "当前模式从 accounts.txt 读取待授权账号；“登录邮箱/登录密码/账号文件”不会参与授权流程。"
 	case modePipeline:
-		return "当前模式注册阶段使用邮箱池、授权阶段使用 accounts.txt；“登录邮箱/登录密码/账号文件”仅用于登录调试，不会参与本模式。"
+		return "当前模式会在同一 worker 内串行执行注册+授权；“授权并发”仅为兼容旧配置保留，不再拆分账号内授权线程。"
 	case modeLogin:
 		return "当前模式只调试单账号登录；优先使用“登录邮箱/登录密码”，未填写时才回退到“账号文件”。"
 	default:

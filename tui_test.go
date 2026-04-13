@@ -196,7 +196,7 @@ func TestDisplayModeConfigHint(t *testing.T) {
 	cases := map[runMode]string{
 		modeRegister:  "当前模式从邮箱池租用账号注册；“登录邮箱/登录密码/账号文件”不会参与注册流程。",
 		modeAuthorize: "当前模式从 accounts.txt 读取待授权账号；“登录邮箱/登录密码/账号文件”不会参与授权流程。",
-		modePipeline:  "当前模式注册阶段使用邮箱池、授权阶段使用 accounts.txt；“登录邮箱/登录密码/账号文件”仅用于登录调试，不会参与本模式。",
+		modePipeline:  "当前模式会在同一 worker 内串行执行注册+授权；“授权并发”仅为兼容旧配置保留，不再拆分账号内授权线程。",
 		modeLogin:     "当前模式只调试单账号登录；优先使用“登录邮箱/登录密码”，未填写时才回退到“账号文件”。",
 	}
 
@@ -227,7 +227,7 @@ func TestWorkerCardLayoutForMode(t *testing.T) {
 	}{
 		{name: "register", mode: modeRegister, workers: 3, authorizeWorker: 2, wantRegister: 3, wantAuthorize: 0},
 		{name: "authorize", mode: modeAuthorize, workers: 4, authorizeWorker: 2, wantRegister: 0, wantAuthorize: 4},
-		{name: "pipeline", mode: modePipeline, workers: 2, authorizeWorker: 5, wantRegister: 2, wantAuthorize: 5},
+		{name: "pipeline", mode: modePipeline, workers: 2, authorizeWorker: 5, wantRegister: 2, wantAuthorize: 0},
 		{name: "login", mode: modeLogin, workers: 2, authorizeWorker: 5, wantRegister: 0, wantAuthorize: 0},
 	}
 
@@ -323,7 +323,7 @@ func TestWorkerSummaryText(t *testing.T) {
 		authorizeWorkers: 3,
 	}, make(chan struct{}), make(chan config), nil)
 
-	if got := model.workerSummaryText(); got != "注册线程=2，授权线程=3" {
+	if got := model.workerSummaryText(); got != "注册线程=2，授权线程=0" {
 		t.Fatalf("unexpected worker summary: %q", got)
 	}
 }
@@ -336,7 +336,7 @@ func TestFooterViewContainsWorkerSummary(t *testing.T) {
 	}, make(chan struct{}), make(chan config), nil)
 
 	rendered := model.footerView()
-	if !strings.Contains(rendered, "注册线程=2，授权线程=3") {
+	if !strings.Contains(rendered, "注册线程=2，授权线程=0") {
 		t.Fatalf("expected footer to contain worker summary, got %q", rendered)
 	}
 }

@@ -59,11 +59,11 @@ func TestIsRegisteredEmailFromIdentifierResultRejectsUnknownStep(t *testing.T) {
 
 func TestShouldDispatchPipelineRegisterJob(t *testing.T) {
 	cases := []struct {
-		name    string
-		target  int
-		success int
+		name     string
+		target   int
+		success  int
 		inFlight int
-		want    bool
+		want     bool
 	}{
 		{name: "needs refill", target: 5, success: 2, inFlight: 1, want: true},
 		{name: "already saturated", target: 5, success: 2, inFlight: 3, want: false},
@@ -83,5 +83,23 @@ func TestIsNoAvailableLeaseError(t *testing.T) {
 	}
 	if isNoAvailableLeaseError(errors.New("调用 web_mail 失败: timeout")) {
 		t.Fatal("did not expect timeout lease error to stop pipeline register")
+	}
+}
+
+func TestIsLeaseFailureReason(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   bool
+	}{
+		{reason: "lease_account", want: true},
+		{reason: "lease_account_unavailable", want: true},
+		{reason: "client_init", want: false},
+		{reason: "send_otp", want: false},
+	}
+
+	for _, tc := range cases {
+		if got := isLeaseFailureReason(tc.reason); got != tc.want {
+			t.Fatalf("reason=%q got %v want %v", tc.reason, got, tc.want)
+		}
 	}
 }

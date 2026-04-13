@@ -71,6 +71,18 @@ type turnstileRequirementsProfile struct {
 	TimeOrigin          float64
 }
 
+type browserHints struct {
+	sendClientHints bool
+	versionMajor    string
+	versionFull     string
+	platformName    string
+	platformVersion string
+	architecture    string
+	vendor          string
+	webGLVendor     string
+	webGLRenderer   string
+}
+
 var authWindowKeyOrder = []string{
 	"0", "window", "self", "document", "name", "location", "customElements", "history", "navigation", "locationbar",
 	"menubar", "personalbar", "scrollbars", "statusbar", "toolbar", "status", "closed", "frames", "length", "top",
@@ -545,28 +557,30 @@ func (s *turnstileSolver) initRuntime() {
 }
 
 func (s *turnstileSolver) buildWindow() map[string]any {
-	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-	lang := "zh-CN"
-	languagesJoin := "zh-CN,en-US"
-	width := 2048
-	height := 1152
-	innerWidth := 800
-	innerHeight := 600
+	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+	lang := "en-US"
+	languagesJoin := "en-US,en"
+	width := 1512
+	height := 982
+	innerWidth := width
+	innerHeight := height - 86
 	outerWidth := 160
 	outerHeight := 28
 	screenX := -25600
 	screenY := -25600
 	hardwareConcurrency := 8
 	heapLimit := int64(4294705152)
-	deviceID := "bb13486d-db99-4547-81a4-a8f2a6351be9"
+	deviceID := "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 	timeOrigin := float64(time.Now().Add(-10 * time.Second).UnixMilli())
-	performanceNow := 9270.399999976158
+	performanceNow := 9270.4
 	vendor := "Google Inc."
-	platform := "Win32"
+	platform := "MacIntel"
 	documentProbe := "__reactContainer$b63yiita51i"
-	windowProbe := "ondragend"
+	windowProbe := "__oai_cached_session"
 	if s.profile.ScreenSum > 0 {
 		width, height = splitScreenSum(s.profile.ScreenSum)
+		innerWidth = width
+		innerHeight = maxInt(height-86, 640)
 	}
 	if strings.TrimSpace(s.profile.UserAgent) != "" {
 		ua = s.profile.UserAgent
@@ -604,9 +618,11 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 		}
 		if s.session.ScreenWidth > 0 {
 			width = s.session.ScreenWidth
+			innerWidth = width
 		}
 		if s.session.ScreenHeight > 0 {
 			height = s.session.ScreenHeight
+			innerHeight = maxInt(height-86, 640)
 		}
 		if s.session.HardwareConcurrency > 0 {
 			hardwareConcurrency = s.session.HardwareConcurrency
@@ -636,6 +652,14 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 			windowProbe = strings.TrimSpace(s.session.Persona.WindowProbe)
 		}
 	}
+	browserHints := deriveBrowserHints(ua, platform, vendor)
+	statsigSessionID := strings.TrimSpace(s.profile.SessionID)
+	if statsigSessionID == "" && s.session != nil {
+		statsigSessionID = strings.TrimSpace(s.session.Persona.SessionID)
+	}
+	if statsigSessionID == "" {
+		statsigSessionID = "session-" + strings.ReplaceAll(deviceID, "-", "")
+	}
 	location := withOrderedKeys(map[string]any{
 		"href":   "https://auth.openai.com/create-account/password",
 		"search": "",
@@ -646,7 +670,7 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 	}
 	localStorageData := withOrderedKeys(map[string]any{
 		"statsig.stable_id.444584300":         `"` + deviceID + `"`,
-		"statsig.session_id.444584300":        `{"sessionID":"acba2013-7acb-405b-8064-7917fe2d8b4d","startTime":1775195126921,"lastUpdate":1775195156096}`,
+		"statsig.session_id.444584300":        fmt.Sprintf(`{"sessionID":%q,"startTime":%.0f,"lastUpdate":%.0f}`, statsigSessionID, timeOrigin, timeOrigin+performanceNow),
 		"statsig.network_fallback.2742193661": `{"initialize":{"urlConfigChecksum":"3392903","url":"https://assetsconfigcdn.org/v1/initialize","expiryTime":1775799927542,"previous":[]}}`,
 	}, []string{
 		"statsig.stable_id.444584300",
@@ -792,9 +816,9 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 						param := toIntIndex(args[0])
 						switch param {
 						case 37445, 7936:
-							return "Google Inc. (NVIDIA)", nil
+							return browserHints.webGLVendor, nil
 						case 37446, 7937:
-							return "ANGLE (NVIDIA, NVIDIA GeForce RTX 5080 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)", nil
+							return browserHints.webGLRenderer, nil
 						default:
 							return nil, nil
 						}
@@ -806,11 +830,11 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 	})
 	navigator := withOrderedKeys(map[string]any{
 		"userAgent":           ua,
-		"vendor":              vendor,
+		"vendor":              browserHints.vendor,
 		"platform":            platform,
 		"hardwareConcurrency": float64(hardwareConcurrency),
 		"deviceMemory":        float64(8),
-		"maxTouchPoints":      float64(10),
+		"maxTouchPoints":      float64(0),
 		"language":            lang,
 		"languages":           stringSliceToAny(strings.Split(strings.ReplaceAll(languagesJoin, ";q=0.9", ""), ",")),
 		"webdriver":           false,
@@ -826,24 +850,28 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 			}, []string{}), nil
 		}),
 	}, []string{})
-	navigator["userAgentData"] = withOrderedKeys(map[string]any{
-		"brands": []any{
-			withOrderedKeys(map[string]any{"brand": "Chromium", "version": "142"}, []string{}),
-			withOrderedKeys(map[string]any{"brand": "Google Chrome", "version": "142"}, []string{}),
-			withOrderedKeys(map[string]any{"brand": "Not_A Brand", "version": "99"}, []string{}),
-		},
-		"mobile":   false,
-		"platform": "Windows",
-		"getHighEntropyValues": vmFunc(func(args ...any) (any, error) {
-			return withOrderedKeys(map[string]any{
-				"platform":        "Windows",
-				"platformVersion": "10.0.0",
-				"architecture":    "x86",
-				"model":           "",
-				"uaFullVersion":   "142.0.0.0",
-			}, []string{}), nil
-		}),
-	}, []string{})
+	if browserHints.sendClientHints {
+		navigator["userAgentData"] = withOrderedKeys(map[string]any{
+			"brands": []any{
+				withOrderedKeys(map[string]any{"brand": "Chromium", "version": browserHints.versionMajor}, []string{}),
+				withOrderedKeys(map[string]any{"brand": "Google Chrome", "version": browserHints.versionMajor}, []string{}),
+				withOrderedKeys(map[string]any{"brand": "Not_A Brand", "version": "24"}, []string{}),
+			},
+			"mobile":   false,
+			"platform": browserHints.platformName,
+			"getHighEntropyValues": vmFunc(func(args ...any) (any, error) {
+				return withOrderedKeys(map[string]any{
+					"platform":        browserHints.platformName,
+					"platformVersion": browserHints.platformVersion,
+					"architecture":    browserHints.architecture,
+					"model":           "",
+					"uaFullVersion":   browserHints.versionFull,
+				}, []string{}), nil
+			}),
+		}, []string{})
+	} else {
+		navigator["userAgentData"] = nil
+	}
 	start := time.Now()
 	navigator[prototypeMeta] = withOrderedKeys(map[string]any{}, authNavigatorPrototypeKeys)
 	for _, key := range authNavigatorPrototypeKeys {
@@ -977,7 +1005,11 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 	window["clientInformation"] = navigator
 	window["screenLeft"] = float64(screenX)
 	window["screenTop"] = float64(screenY)
-	window["chrome"] = withOrderedKeys(map[string]any{"runtime": withOrderedKeys(map[string]any{}, []string{})}, []string{})
+	if browserHints.sendClientHints {
+		window["chrome"] = withOrderedKeys(map[string]any{"runtime": withOrderedKeys(map[string]any{}, []string{})}, []string{})
+	} else {
+		window["chrome"] = nil
+	}
 	window["__reactRouterContext"] = withOrderedKeys(map[string]any{
 		"future":         withOrderedKeys(map[string]any{}, []string{}),
 		"routeDiscovery": withOrderedKeys(map[string]any{}, []string{}),
@@ -986,7 +1018,7 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 		"loaderData": withOrderedKeys(map[string]any{
 			"routes/layouts/client-auth-session-layout/layout": withOrderedKeys(map[string]any{
 				"session": withOrderedKeys(map[string]any{
-					"session_id":              s.profile.SessionID,
+					"session_id":              statsigSessionID,
 					"auth_session_logging_id": "3691f3d7-3e89-440c-99c1-0788585b7688",
 				}, []string{}),
 			}, []string{}),
@@ -1022,6 +1054,63 @@ func (s *turnstileSolver) buildWindow() map[string]any {
 		}
 	}
 	return window
+}
+
+func deriveBrowserHints(ua, platform, vendor string) browserHints {
+	hints := browserHints{
+		sendClientHints: true,
+		versionMajor:    "135",
+		versionFull:     "135.0.0.0",
+		platformName:    "macOS",
+		platformVersion: "15.3.1",
+		architecture:    "x86",
+		vendor:          vendor,
+		webGLVendor:     "Google Inc. (Apple)",
+		webGLRenderer:   "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)",
+	}
+	if strings.TrimSpace(hints.vendor) == "" {
+		hints.vendor = "Google Inc."
+	}
+	if strings.EqualFold(strings.TrimSpace(platform), "Win32") {
+		hints.platformName = "Windows"
+		hints.platformVersion = "10.0.0"
+		hints.webGLVendor = "Google Inc. (NVIDIA)"
+		hints.webGLRenderer = "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+	}
+	if version := findUserAgentVersion(ua, `Chrome/([0-9]+(?:\.[0-9]+)*)`); version != "" {
+		hints.versionFull = version
+		hints.versionMajor = splitVersionMajor(version)
+	}
+	if strings.Contains(ua, "Version/") && strings.Contains(ua, "Safari/") && !strings.Contains(ua, "Chrome/") {
+		hints.sendClientHints = false
+		hints.vendor = "Apple Computer, Inc."
+		if version := findUserAgentVersion(ua, `Version/([0-9]+(?:\.[0-9]+)*)`); version != "" {
+			hints.versionFull = version
+			hints.versionMajor = splitVersionMajor(version)
+		}
+		hints.webGLVendor = "Apple Inc."
+		hints.webGLRenderer = "Apple GPU"
+	}
+	return hints
+}
+
+func findUserAgentVersion(ua, pattern string) string {
+	matches := regexp.MustCompile(pattern).FindStringSubmatch(ua)
+	if len(matches) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(matches[1])
+}
+
+func splitVersionMajor(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return ""
+	}
+	if index := strings.IndexByte(version, '.'); index >= 0 {
+		return version[:index]
+	}
+	return version
 }
 
 func (s *turnstileSolver) runQueue() error {

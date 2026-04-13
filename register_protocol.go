@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/big"
 	"net/url"
 	"os"
 	"strings"
@@ -14,6 +12,7 @@ import (
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
+	"go-register/utils"
 )
 
 const (
@@ -27,6 +26,7 @@ const (
 	registerPasswordPageURL    = "https://auth.openai.com/create-account/password"
 	registerVerifyEmailPageURL = "https://auth.openai.com/create-account/verify-email"
 	registerAboutYouPageURL    = "https://auth.openai.com/about-you"
+	maxLeaseFailureStreak      = 5
 )
 
 // registrationAttemptResult 记录单个注册任务的持久化结果。
@@ -38,6 +38,9 @@ type registrationAttemptResult struct {
 	Reason   string
 	Err      error
 	Stop     bool
+
+	OAuthStatus string
+	OAuthErr    error
 }
 
 type registerSignInResponse struct {
@@ -55,7 +58,7 @@ type createAccountPayload struct {
 
 // runRegister 负责批量注册的调度、结果聚合和落盘。
 // Why: 这里把并发控制、TUI 统计更新和协议细节解耦，后续即使要增加重试或限速，也不需要改动底层注册请求顺序。
-func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeJobs chan<- accountRecord) error {
+func runRegister(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeInline bool) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("register 模式下 count 必须大于 0")
 	}
@@ -79,7 +82,7 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 			defer workers.Done()
 			for range jobs {
 				ui.RecordRegisterStart()
-				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
+				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, ui, authorizeInline, workerID)
 				ui.RecordRegisterFinish(result.Status == "ok")
 				results <- result
 			}
@@ -97,7 +100,10 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 
 	success := 0
 	fail := 0
+	authorizeSuccess := 0
+	authorizeFail := 0
 	var firstErr error
+	var firstAuthorizeErr error
 	for result := range results {
 		switch result.Status {
 		case "ok":
@@ -109,21 +115,36 @@ func runRegister(parent context.Context, cfg config, mailClient *webMailClient, 
 				firstErr = result.Err
 			}
 		}
+		if strings.TrimSpace(result.OAuthStatus) == "" {
+			continue
+		}
+		if isOAuthSuccessful(result.OAuthStatus) {
+			authorizeSuccess++
+			continue
+		}
+		authorizeFail++
+		logger.Printf("授权失败账号=%s status=%s err=%v", result.Email, result.OAuthStatus, result.OAuthErr)
+		if firstAuthorizeErr == nil && result.OAuthErr != nil {
+			firstAuthorizeErr = result.OAuthErr
+		}
 	}
 
-	logger.Printf("注册任务结束: success=%d fail=%d output=%s", success, fail, cfg.accountsFile)
+	logger.Printf("注册任务结束: success=%d fail=%d authorize_success=%d authorize_fail=%d output=%s", success, fail, authorizeSuccess, authorizeFail, cfg.accountsFile)
 	if success == 0 && fail > 0 {
 		if firstErr != nil {
 			return fmt.Errorf("全部注册失败: %w", firstErr)
 		}
 		return fmt.Errorf("全部注册失败")
 	}
+	if firstAuthorizeErr != nil {
+		return fmt.Errorf("注册阶段已完成，但授权阶段存在失败: %w", firstAuthorizeErr)
+	}
 	return nil
 }
 
 // runRegisterUntilTargetSuccess 在 pipeline 模式下持续注册，直到注册成功数达到目标。
 // Why: pipeline 需要保证授权线程最终拿到足够多的已注册账号；如果只按固定尝试次数结束，注册刚达标时授权侧可能还没收尾完成。
-func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeJobs chan<- accountRecord) error {
+func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeInline bool) error {
 	if cfg.count <= 0 {
 		return fmt.Errorf("pipeline 模式下 count 必须大于 0")
 	}
@@ -147,7 +168,7 @@ func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClien
 			defer workers.Done()
 			for range jobs {
 				ui.RecordRegisterStart()
-				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, authorizeJobs, workerID)
+				result := runRegisterAttempt(parent, cfg, mailClient, logger, store, ui, authorizeInline, workerID)
 				ui.RecordRegisterFinish(result.Status == "ok")
 				results <- result
 			}
@@ -156,11 +177,15 @@ func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClien
 
 	success := 0
 	fail := 0
+	authorizeSuccess := 0
+	authorizeFail := 0
 	inFlight := 0
 	nextJobID := 0
+	leaseFailureStreak := 0
 	stopRequested := false
 	stopMessage := ""
 	var firstErr error
+	var firstAuthorizeErr error
 
 	dispatchJob := func() {
 		nextJobID++
@@ -179,17 +204,40 @@ func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClien
 		switch result.Status {
 		case "ok":
 			success++
+			leaseFailureStreak = 0
 		default:
 			fail++
 			logger.Printf("注册失败账号=%s reason=%s err=%v", result.Email, result.Reason, result.Err)
 			if firstErr == nil && result.Err != nil {
 				firstErr = result.Err
 			}
+			if isLeaseFailureReason(result.Reason) {
+				leaseFailureStreak++
+				if leaseFailureStreak >= maxLeaseFailureStreak && !stopRequested {
+					// Why: pipeline 在目标成功数未达标时会持续补发任务；连续租号失败说明邮箱池/服务侧已经不可用，不应无限打满循环。
+					stopRequested = true
+					stopMessage = fmt.Sprintf("连续租用邮箱失败达到 %d 次", leaseFailureStreak)
+					logger.Printf("pipeline 注册阶段停止补发新任务: %s", stopMessage)
+				}
+			} else {
+				leaseFailureStreak = 0
+			}
 			if result.Stop && !stopRequested {
 				// Why: 邮箱池已空时继续补发注册任务只会产生相同失败，因此这里把它当作 pipeline 注册侧的停止信号。
 				stopRequested = true
 				stopMessage = "当前没有可用邮箱账号"
 				logger.Printf("pipeline 注册阶段停止补发新任务: %s", stopMessage)
+			}
+		}
+		if strings.TrimSpace(result.OAuthStatus) != "" {
+			if isOAuthSuccessful(result.OAuthStatus) {
+				authorizeSuccess++
+			} else {
+				authorizeFail++
+				logger.Printf("授权失败账号=%s status=%s err=%v", result.Email, result.OAuthStatus, result.OAuthErr)
+				if firstAuthorizeErr == nil && result.OAuthErr != nil {
+					firstAuthorizeErr = result.OAuthErr
+				}
 			}
 		}
 
@@ -204,8 +252,11 @@ func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClien
 	workers.Wait()
 	close(results)
 
-	logger.Printf("注册任务结束: success=%d fail=%d output=%s", success, fail, cfg.accountsFile)
+	logger.Printf("注册任务结束: success=%d fail=%d authorize_success=%d authorize_fail=%d output=%s", success, fail, authorizeSuccess, authorizeFail, cfg.accountsFile)
 	if success >= cfg.count {
+		if firstAuthorizeErr != nil {
+			return fmt.Errorf("注册已达到目标数量=%d，但授权阶段存在失败: %w", cfg.count, firstAuthorizeErr)
+		}
 		return nil
 	}
 	if stopRequested {
@@ -229,6 +280,9 @@ func runRegisterUntilTargetSuccess(parent context.Context, cfg config, mailClien
 	if firstErr != nil {
 		return fmt.Errorf("注册未达到目标数量: success=%d target=%d: %w", success, cfg.count, firstErr)
 	}
+	if firstAuthorizeErr != nil {
+		return fmt.Errorf("注册未达到目标数量且授权存在失败: success=%d target=%d: %w", success, cfg.count, firstAuthorizeErr)
+	}
 	return fmt.Errorf("注册未达到目标数量: success=%d target=%d", success, cfg.count)
 }
 
@@ -247,9 +301,17 @@ func isNoAvailableLeaseError(err error) bool {
 	return strings.Contains(err.Error(), "当前没有可用邮箱账号")
 }
 
+// isLeaseFailureReason 判断失败原因是否发生在邮箱租用阶段。
+// Why: 只有租号环节连续失败才代表“无法拿到输入账号”，这时应停止 pipeline 补发，而不是把业务注册失败也计入同一阈值。
+func isLeaseFailureReason(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	return reason == "lease_account" || reason == "lease_account_unavailable"
+}
+
 // runRegisterAttempt 负责单个邮箱租约的一次完整注册尝试。
 // 核心流程：租号 -> 纯协议注册 -> 立即写入 accounts.txt -> 成功标记 used / 失败归还租约。
-func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, authorizeJobs chan<- accountRecord, workerID int) registrationAttemptResult {
+func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeInline bool, workerID int) registrationAttemptResult {
+	cfg.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
@@ -321,8 +383,12 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	result.Status = "ok"
 	result.Reason = "ok"
 	result.Err = nil
+	record := accountRecord{
+		Email:    result.Email,
+		Password: result.Password,
+	}
 	if store != nil {
-		record, writeErr := store.upsertRegistration(result.Email, result.Password, "ok", time.Now())
+		updatedRecord, writeErr := store.upsertRegistration(result.Email, result.Password, "ok", time.Now())
 		if writeErr != nil {
 			result.Status = "fail"
 			result.Reason = "accounts_write"
@@ -330,14 +396,19 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 			logger.Printf("%s 注册成功但写入 accounts 失败: %v", prefix, writeErr)
 			return result
 		}
-		if authorizeJobs != nil {
-			if !enqueueAuthorizeJob(attemptCtx, logger, prefix, authorizeJobs, record) {
-				logger.Printf("%s 授权队列投递中断，账号仍保留为 oauth=pending，可后续补授权", prefix)
-			}
-		}
+		record = updatedRecord
 	}
 	markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
 	logger.Printf("%s 注册成功", prefix)
+	if authorizeInline {
+		logger.Printf("%s 注册成功后继续复用同一链路执行授权", prefix)
+		authorizationResult := authorizeAccountWithClient(attemptCtx, cfg, mailClient, logger, store, record, client, prefix)
+		result.OAuthStatus = authorizationResult.OAuthStatus
+		result.OAuthErr = authorizationResult.Err
+		if ui != nil {
+			ui.RecordAuthorizeFinish(isAuthorizationSuccessful(authorizationResult))
+		}
+	}
 	return result
 }
 
@@ -445,7 +516,7 @@ func (c *protocolClient) bootstrapSignupPage(ctx context.Context, email string) 
 
 	params := url.Values{}
 	params.Set("prompt", "login")
-	params.Set("ext-oai-did", randomUUID())
+	params.Set("ext-oai-did", c.deviceID)
 	params.Set("screen_hint", "login_or_signup")
 	params.Set("login_hint", email)
 
@@ -483,7 +554,7 @@ func (c *protocolClient) bootstrapSignupPage(ctx context.Context, email string) 
 
 // submitSignupIdentifier 提交注册邮箱，并写入当前 auth session。
 func (c *protocolClient) submitSignupIdentifier(ctx context.Context, cfg config, bootstrap *bootstrapPage, email string) (*httpResult, error) {
-	sentinelHeader, err := buildSentinelHeader(ctx, cfg, bootstrap, "username_password_create", registerStartPageURL)
+	sentinelHeader, err := buildSentinelHeader(ctx, cfg, c, bootstrap, "username_password_create", registerStartPageURL)
 	if err != nil {
 		return nil, fmt.Errorf("生成 username_password_create sentinel 失败: %w", err)
 	}
@@ -515,7 +586,7 @@ func (c *protocolClient) submitSignupIdentifier(ctx context.Context, cfg config,
 // submitRegisterPassword 提交注册密码。
 // Why: 这里继续沿用 username_password_create flow，是为了与参考脚本和当前前端页面的 Sentinel 语义保持一致。
 func (c *protocolClient) submitRegisterPassword(ctx context.Context, cfg config, bootstrap *bootstrapPage, email, password string) (*httpResult, error) {
-	sentinelHeader, err := buildSentinelHeader(ctx, cfg, bootstrap, "username_password_create", registerPasswordPageURL)
+	sentinelHeader, err := buildSentinelHeader(ctx, cfg, c, bootstrap, "username_password_create", registerPasswordPageURL)
 	if err != nil {
 		return nil, fmt.Errorf("生成注册密码 sentinel 失败: %w", err)
 	}
@@ -592,7 +663,7 @@ func (c *protocolClient) validateRegisterEmailOTP(ctx context.Context, code stri
 
 // submitCreateAccount 提交姓名和生日，完成注册链路的最后一步。
 func (c *protocolClient) submitCreateAccount(ctx context.Context, cfg config, bootstrap *bootstrapPage, payload createAccountPayload) (*httpResult, error) {
-	sentinelHeader, err := buildSentinelHeader(ctx, cfg, bootstrap, "oauth_create_account", registerAboutYouPageURL)
+	sentinelHeader, err := buildSentinelHeader(ctx, cfg, c, bootstrap, "oauth_create_account", registerAboutYouPageURL)
 	if err != nil {
 		return nil, fmt.Errorf("生成 create_account sentinel 失败: %w", err)
 	}
@@ -731,7 +802,7 @@ func returnAccountWithCleanup(cfg config, mailClient *webMailClient, lease *webM
 	defer cancel()
 
 	// Why: 主流程上下文可能已经因超时取消，归还租约必须脱离主链路单独兜底，否则邮箱会长期卡在 leased 状态。
-	if err := runWithWaitLog(cleanupCtx, waitLogFunc(logger.Printf, prefix+" 归还邮箱"), func() error {
+	if err := utils.RunWithWaitLog(cleanupCtx, utils.WaitLogFunc(logger.Printf, prefix+" 归还邮箱"), func() error {
 		return mailClient.returnAccount(cleanupCtx, lease.ID, lease.LeaseToken)
 	}); err != nil {
 		logger.Printf("%s 归还邮箱失败: %v", prefix, err)
@@ -743,7 +814,7 @@ func markUsedWithCleanup(cfg config, mailClient *webMailClient, lease *webMailAc
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout(cfg))
 	defer cancel()
 
-	if err := runWithWaitLog(cleanupCtx, waitLogFunc(logger.Printf, prefix+" 标记邮箱已使用"), func() error {
+	if err := utils.RunWithWaitLog(cleanupCtx, utils.WaitLogFunc(logger.Printf, prefix+" 标记邮箱已使用"), func() error {
 		return mailClient.markUsed(cleanupCtx, lease.ID, lease.LeaseToken)
 	}); err != nil {
 		logger.Printf("%s 标记邮箱已使用失败: %v", prefix, err)
@@ -781,7 +852,7 @@ func enqueueAuthorizeJob(ctx context.Context, logger *log.Logger, prefix string,
 
 // generateRegistrationPassword 生成与参考脚本兼容的注册密码格式。
 func generateRegistrationPassword() string {
-	return randomAlphaNumeric(10) + "aA1!"
+	return utils.RandomAlphaNumeric(10) + "aA1!"
 }
 
 // randomCreateAccountPayload 构造 about-you 阶段需要的人设信息。
@@ -794,71 +865,13 @@ func randomCreateAccountPayload() createAccountPayload {
 
 // randomProfileName 生成“首字母大写 + 若干小写字母”的随机姓名。
 func randomProfileName() string {
-	return randomCharset("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1) + randomCharset("abcdefghijklmnopqrstuvwxyz", randomInt(4, 8))
+	return utils.RandomCharset("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 1) + utils.RandomCharset("abcdefghijklmnopqrstuvwxyz", utils.RandomInt(4, 8))
 }
 
 // randomBirthdate 把生日限制在稳定可接受的成年区间，减少无效风控噪声。
 func randomBirthdate() string {
-	year := randomInt(1985, 2002)
-	month := randomInt(1, 12)
-	day := randomInt(1, 28)
+	year := utils.RandomInt(1985, 2002)
+	month := utils.RandomInt(1, 12)
+	day := utils.RandomInt(1, 28)
 	return fmt.Sprintf("%04d-%02d-%02d", year, month, day)
-}
-
-// randomAlphaNumeric 生成指定长度的字母数字随机串。
-func randomAlphaNumeric(length int) string {
-	return randomCharset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", length)
-}
-
-// randomCharset 从给定字符集里均匀抽样，避免引入 math/rand 的可预测序列。
-func randomCharset(charset string, length int) string {
-	if length <= 0 || charset == "" {
-		return ""
-	}
-
-	builder := strings.Builder{}
-	builder.Grow(length)
-	maxIndex := big.NewInt(int64(len(charset)))
-	for i := 0; i < length; i++ {
-		index, err := rand.Int(rand.Reader, maxIndex)
-		if err != nil {
-			panic(err)
-		}
-		builder.WriteByte(charset[index.Int64()])
-	}
-	return builder.String()
-}
-
-// randomInt 返回闭区间 [min, max] 的随机整数。
-func randomInt(min, max int) int {
-	if max <= min {
-		return min
-	}
-
-	delta := big.NewInt(int64(max - min + 1))
-	value, err := rand.Int(rand.Reader, delta)
-	if err != nil {
-		panic(err)
-	}
-	return min + int(value.Int64())
-}
-
-// randomUUID 生成 ext-oai-did 需要的 UUIDv4 字符串。
-func randomUUID() string {
-	buffer := make([]byte, 16)
-	if _, err := rand.Read(buffer); err != nil {
-		panic(err)
-	}
-
-	buffer[6] = (buffer[6] & 0x0f) | 0x40
-	buffer[8] = (buffer[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf(
-		"%08x-%04x-%04x-%04x-%012x",
-		buffer[0:4],
-		buffer[4:6],
-		buffer[6:8],
-		buffer[8:10],
-		buffer[10:16],
-	)
 }

@@ -106,7 +106,7 @@ func executeMode(parent context.Context, cfg config, mailClient *webMailClient, 
 	}
 	switch cfg.mode {
 	case modeRegister:
-		return runRegister(parent, cfg, mailClient, logger, store, ui, nil)
+		return runRegister(parent, cfg, mailClient, logger, store, ui, false)
 	case modeAuthorize:
 		return runAuthorizeFromAccounts(parent, cfg, mailClient, logger, store, ui)
 	case modePipeline:
