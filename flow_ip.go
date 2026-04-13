@@ -2,65 +2,129 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	stdhttp "net/http"
-	"net/url"
+	"net"
 	"strings"
 	"time"
+	"unicode"
 
 	"go-register/utils"
 )
 
-const flowUnknownIP = "ip-unknown"
+const (
+	flowUnknownIP  = "ip-unknown"
+	flowIPProbeURL = "https://api.ip.cc"
+)
 
-type flowLogger interface {
-	Printf(string, ...any)
+// prepareFlowClient 在单账号流程开始时统一创建协议客户端并探测实际出口 IP。
+// Why: 用户要求 IP 查询也使用真实浏览器指纹，因此这里直接复用 protocolClient，保证 IP 探测和后续主流程走同一条链路。
+func prepareFlowClient(parent context.Context, cfg config, logger *log.Logger, threadLabel string) (config, *protocolClient, string, error) {
+	cfg.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+
+	client, err := newProtocolClient(cfg, logger)
+	if err != nil {
+		return cfg, nil, flowUnknownIP, err
+	}
+
+	flowIP := flowUnknownIP
+	probeCtx, cancel := context.WithTimeout(parent, flowIPProbeTimeout(cfg))
+	defer cancel()
+
+	resolvedIP, err := resolveFlowPublicIPWithClient(probeCtx, client)
+	if err != nil {
+		if logger != nil {
+			logger.Printf("[%s][%s] 获取实际IP失败: %v", strings.TrimSpace(threadLabel), flowUnknownIP, err)
+		}
+		return cfg, client, flowIP, nil
+	}
+
+	flowIP = resolvedIP
+	if logger != nil {
+		logger.Printf("[%s][%s] 实际IP=%s", strings.TrimSpace(threadLabel), flowIP, flowIP)
+	}
+	return cfg, client, flowIP, nil
 }
 
-// resolveFlowPublicIP 通过当前流程代理链路查询真实出口 IP。
-// Why: 用户需要按“单账号流程”观察真实出口 IP，因此这里显式复用当前流程代理，避免日志中的 IP 与实际请求链路不一致。
-func resolveFlowPublicIP(ctx context.Context, cfg config) (string, error) {
-	transport := &stdhttp.Transport{}
-	if strings.TrimSpace(cfg.proxy) != "" {
-		proxyURL, err := url.Parse(strings.TrimSpace(cfg.proxy))
-		if err != nil {
-			return "", fmt.Errorf("解析 IP 探测代理失败: %w", err)
-		}
-		transport.Proxy = stdhttp.ProxyURL(proxyURL)
+// resolveFlowPublicIPWithClient 通过真实浏览器指纹客户端查询当前出口 IP。
+// Why: 只有复用同一个 TLS/UA/代理链路，日志里的实际 IP 才能真正对应当前账号流程。
+func resolveFlowPublicIPWithClient(ctx context.Context, client *protocolClient) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("nil protocol client")
 	}
 
-	client := &stdhttp.Client{
-		Timeout:   cfg.requestTimeout,
-		Transport: transport,
-	}
-	request, err := stdhttp.NewRequestWithContext(ctx, stdhttp.MethodGet, "http://ping0.cc", nil)
+	result, err := client.doRequest(ctx, requestOptions{
+		Method:        "GET",
+		URL:           flowIPProbeURL,
+		AllowRedirect: true,
+		Accept:        "application/json,text/plain;q=0.9,*/*;q=0.8",
+		Profile:       profileAPI,
+	})
 	if err != nil {
-		return "", fmt.Errorf("创建 IP 探测请求失败: %w", err)
+		return "", fmt.Errorf("请求 %s 失败: %w", flowIPProbeURL, err)
 	}
-	request.Header.Set("User-Agent", defaultOAuthUserAgent)
+	if result.StatusCode < 200 || result.StatusCode >= 300 {
+		return "", fmt.Errorf("请求 %s 返回异常状态: %d body=%s", flowIPProbeURL, result.StatusCode, limitBody(result.Body))
+	}
 
-	response, err := client.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("请求 ping0.cc 失败: %w", err)
-	}
-	defer func() {
-		_ = response.Body.Close()
-	}()
-
-	body, err := io.ReadAll(io.LimitReader(response.Body, 256))
-	if err != nil {
-		return "", fmt.Errorf("读取 ping0.cc 响应失败: %w", err)
-	}
-	ip := strings.TrimSpace(string(body))
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("请求 ping0.cc 返回异常状态: %d body=%s", response.StatusCode, ip)
-	}
+	ip := extractFirstIP(result.Body)
 	if ip == "" {
-		return "", fmt.Errorf("ping0.cc 返回空 IP")
+		return "", fmt.Errorf("%s 未返回合法IP body=%s", flowIPProbeURL, limitBody(result.Body))
 	}
 	return ip, nil
+}
+
+// extractFirstIP 优先从 JSON 字段中递归提取 IP，再回退到文本扫描。
+// Why: api.ip.cc 返回 JSON；递归取值可以兼容不同字段名，避免把整个 JSON 串打印进日志前缀。
+func extractFirstIP(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err == nil {
+		if ip := extractFirstIPFromValue(payload); ip != "" {
+			return ip
+		}
+	}
+
+	return extractFirstIPFromText(body)
+}
+
+func extractFirstIPFromValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return extractFirstIPFromText(typed)
+	case []any:
+		for _, item := range typed {
+			if ip := extractFirstIPFromValue(item); ip != "" {
+				return ip
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if ip := extractFirstIPFromValue(item); ip != "" {
+				return ip
+			}
+		}
+	}
+	return ""
+}
+
+func extractFirstIPFromText(text string) string {
+	tokens := strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(`"'<>[](){},`, r)
+	})
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		token = strings.Trim(token, ":;")
+		if ip := net.ParseIP(token); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 // buildFlowLogPrefix 构造带线程与出口 IP 的统一日志前缀。
@@ -76,30 +140,6 @@ func buildFlowLogPrefix(threadLabel, flowIP, email string) string {
 		parts = append(parts, "["+strings.TrimSpace(email)+"]")
 	}
 	return strings.Join(parts, "")
-}
-
-// prepareFlowLogging 在账号流程启动时解析代理占位符并记录当前出口 IP。
-// Why: register/login/authorize 都需要在真正访问 OpenAI 前先拿到本次流程的固定 IP，便于后续整条链路排障。
-func prepareFlowLogging(parent context.Context, cfg config, logger flowLogger, threadLabel string) (config, string) {
-	cfg.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
-	flowIP := flowUnknownIP
-
-	probeCtx, cancel := context.WithTimeout(parent, flowIPProbeTimeout(cfg))
-	defer cancel()
-
-	resolvedIP, err := resolveFlowPublicIP(probeCtx, cfg)
-	if err != nil {
-		if logger != nil {
-			logger.Printf("[%s][%s] 获取实际IP失败: %v", strings.TrimSpace(threadLabel), flowUnknownIP, err)
-		}
-		return cfg, flowIP
-	}
-
-	flowIP = resolvedIP
-	if logger != nil {
-		logger.Printf("[%s][%s] 实际IP=%s", strings.TrimSpace(threadLabel), flowIP, flowIP)
-	}
-	return cfg, flowIP
 }
 
 // flowIPProbeTimeout 为出口 IP 探测单独提供较短超时，避免探测失败拖慢主流程。

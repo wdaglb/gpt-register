@@ -312,13 +312,20 @@ func isLeaseFailureReason(reason string) bool {
 // 核心流程：租号 -> 纯协议注册 -> 立即写入 accounts.txt -> 成功标记 used / 失败归还租约。
 func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeInline bool, workerID int) registrationAttemptResult {
 	threadLabel := fmt.Sprintf("worker-%d", workerID)
-	cfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
+	cfg, client, flowIP, clientErr := prepareFlowClient(parent, cfg, logger, threadLabel)
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
 	result := registrationAttemptResult{
 		Status: "fail",
 		Reason: "lease_account",
+	}
+
+	if clientErr != nil {
+		result.Err = fmt.Errorf("创建协议客户端失败: %w", clientErr)
+		result.Reason = "client_init"
+		logger.Printf("%s 初始化失败: %v", buildFlowLogPrefix(threadLabel, flowIP, ""), clientErr)
+		return result
 	}
 
 	lease, err := mailClient.leaseAccount(attemptCtx)
@@ -337,20 +344,6 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	result.Password = generateRegistrationPassword()
 	prefix := buildFlowLogPrefix(threadLabel, flowIP, lease.Email)
 	logger.Printf("%s 已租到邮箱 account_id=%d", prefix, lease.ID)
-
-	client, err := newProtocolClient(cfg, logger)
-	if err != nil {
-		result.Err = fmt.Errorf("创建协议客户端失败: %w", err)
-		result.Reason = "client_init"
-		if store != nil {
-			if _, writeErr := store.upsertRegistration(result.Email, result.Password, "fail:"+result.Reason, time.Now()); writeErr != nil {
-				result.Err = fmt.Errorf("%v；写入 accounts 失败: %w", result.Err, writeErr)
-			}
-		}
-		returnAccountWithCleanup(cfg, mailClient, lease, logger, prefix)
-		logger.Printf("%s 初始化失败: %v", prefix, err)
-		return result
-	}
 
 	if err := client.registerWithProtocol(attemptCtx, cfg, lease, result.Password, mailClient, logger, prefix); err != nil {
 		result.Err = err

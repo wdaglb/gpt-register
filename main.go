@@ -130,14 +130,17 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 
 	logger.Printf("准备登录账号: %s", account.email)
 	threadLabel := "login"
-	resolvedCfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
+	resolvedCfg, client, flowIP, clientErr := prepareFlowClient(parent, cfg, logger, threadLabel)
 	loginPrefix := buildFlowLogPrefix(threadLabel, flowIP, account.email)
 	flowLogger := newFlowScopedLogger(logger, loginPrefix)
 	loginCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
 	logger.Printf("%s 开始登录流程", loginPrefix)
-	result, err := loginWithProtocol(loginCtx, resolvedCfg, account, mailClient, flowLogger)
+	if clientErr != nil {
+		return fmt.Errorf("%s 创建协议客户端失败: %w", loginPrefix, clientErr)
+	}
+	result, err := loginWithProtocolClient(loginCtx, resolvedCfg, account, mailClient, flowLogger, client)
 	if err != nil {
 		ui.RecordAuthorizeFinish(false)
 		if store != nil {

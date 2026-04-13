@@ -119,13 +119,20 @@ func collectAuthorizationResults(results <-chan authorizationAttemptResult, logg
 // runAuthorizeAttempt 负责单个账号的一次 OAuth 授权尝试，并把结果回写到 accounts.txt。
 func runAuthorizeAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, workerID int, record accountRecord) authorizationAttemptResult {
 	threadLabel := fmt.Sprintf("auth-%d", workerID)
-	cfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
+	cfg, client, flowIP, clientErr := prepareFlowClient(parent, cfg, logger, threadLabel)
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
 	prefix := buildFlowLogPrefix(threadLabel, flowIP, record.Email)
 	logger.Printf("%s 开始授权", prefix)
-	return authorizeAccountWithClient(attemptCtx, cfg, mailClient, logger, store, record, nil, prefix)
+	if clientErr != nil {
+		return authorizationAttemptResult{
+			Email:       record.Email,
+			OAuthStatus: "oauth=fail:client_init",
+			Err:         fmt.Errorf("创建协议客户端失败: %w", clientErr),
+		}
+	}
+	return authorizeAccountWithClient(attemptCtx, cfg, mailClient, logger, store, record, client, prefix)
 }
 
 // authorizeAccountWithClient 统一执行授权并回写 oauth 状态；当客户端非空时复用现有浏览器链路。
