@@ -6,6 +6,7 @@
 
 - 纯协议注册 OpenAI 账号
 - 纯协议执行 OAuth 授权，并在本地 `auth/` 目录生成授权文件
+- 授权成功后可选自动上传 auth 文件到 CPA 管理接口
 - 内置 Go 版 `web_mail` 服务，兼容历史 Python 版 HTTP 接口
 - 支持 `register`、`authorize`、`pipeline`、`login`、`webmail` 五种模式
 - 交互终端默认进入 TUI 首页，支持配置持久化与 worker 卡片视图
@@ -287,6 +288,7 @@ http://user-a8K3mP2xQ9Ld:pass@proxy.example.com:8888
 - `user-file`（仅 `login` 模式在未填写 `email/password` 时兜底）
 - `auth-dir`
 - `accounts-file`
+- `cpa-url` / `cpa-key`（配置后授权成功会自动上传本地 auth 文件）
 - `proxy`
 - `mailbox`
 - `count`
@@ -337,6 +339,8 @@ TUI 会在项目根目录读写 `.config.json`，典型内容如下：
   "user-file": "user.txt",
   "auth-dir": "auth",
   "accounts-file": "accounts.txt",
+  "cpa-url": "",
+  "cpa-key": "",
   "proxy": "http://127.0.0.1:7890",
   "mailbox": "Junk",
   "count": 5,
@@ -353,6 +357,7 @@ TUI 会在项目根目录读写 `.config.json`，典型内容如下：
 
 - 启动 TUI 时会自动读取 `.config.json`
 - 点击“保存配置”或从首页开始运行时，都会自动保存当前配置
+- `cpa-key` 会按现有 TUI 持久化方式明文保存到 `.config.json`
 - `.config.json` 已加入 `.gitignore`
 - `webmail` 模式固定走 CLI，不进入 TUI
 
@@ -547,6 +552,8 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 | `-password` | `login` 模式账号密码；为空时从 `user-file` 读取 |
 | `-user-file` | `login` 模式账号文件，支持两行 `email/password` 或单行 `email----password` |
 | `-auth-dir` | 授权文件输出目录，默认 `auth` |
+| `-cpa-url` | CPA 管理地址；配置后授权成功会自动把 auth JSON 上传到 `/v0/management/auth-files` |
+| `-cpa-key` | CPA 管理密钥；与 `-cpa-url` 配合使用 |
 | `-proxy` | HTTP / HTTPS 代理地址；支持 `{}` 或 `{数字}` 会话占位符，例如 `http://user-{6}:pass@proxy.example.com:8888` |
 | `-mailbox` | 验证码轮询优先邮箱目录，默认 `Junk` |
 | `-count` | `register` / `pipeline` 模式的注册数量 |

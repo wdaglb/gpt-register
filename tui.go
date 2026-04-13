@@ -35,6 +35,8 @@ const (
 	tuiFocusUserFile
 	tuiFocusAuthDir
 	tuiFocusAccountsFile
+	tuiFocusCPAURL
+	tuiFocusCPAKey
 	tuiFocusProxy
 	tuiFocusMailbox
 	tuiFocusCount
@@ -278,6 +280,8 @@ type tuiPersistentConfig struct {
 	UserFile         string `json:"user-file"`
 	AuthDir          string `json:"auth-dir"`
 	AccountsFile     string `json:"accounts-file"`
+	CPAURL           string `json:"cpa-url"`
+	CPAKey           string `json:"cpa-key"`
 	Proxy            string `json:"proxy"`
 	Mailbox          string `json:"mailbox"`
 	Count            int    `json:"count"`
@@ -330,6 +334,8 @@ type runTUIModel struct {
 	userFileInput         textinput.Model
 	authDirInput          textinput.Model
 	accountsFileInput     textinput.Model
+	cpaURLInput           textinput.Model
+	cpaKeyInput           textinput.Model
 	proxyInput            textinput.Model
 	mailboxInput          textinput.Model
 	countInput            textinput.Model
@@ -382,6 +388,8 @@ func newRunTUIModel(cfg config, ready chan struct{}, startCh chan<- config, load
 		userFileInput:         newTUIStringInput(cfg.userFile, false),
 		authDirInput:          newTUIStringInput(cfg.authDir, false),
 		accountsFileInput:     newTUIStringInput(cfg.accountsFile, false),
+		cpaURLInput:           newTUIStringInput(cfg.cpaURL, false),
+		cpaKeyInput:           newTUIStringInput(cfg.cpaKey, true),
 		proxyInput:            newTUIStringInput(cfg.proxy, false),
 		mailboxInput:          newTUIStringInput(cfg.mailbox, false),
 		countInput:            newTUIIntegerInput(cfg.count),
@@ -647,6 +655,8 @@ func (model *runTUIModel) configView() string {
 		model.renderConfigRow(tuiFocusUserFile, "账号文件", renderConfigValueWithHint(model.userFileInput.View(), loginCredentialFieldHint(currentMode, "user-file"))),
 		model.renderConfigRow(tuiFocusAuthDir, "授权目录", model.authDirInput.View()),
 		model.renderConfigRow(tuiFocusAccountsFile, "状态文件", model.accountsFileInput.View()),
+		model.renderConfigRow(tuiFocusCPAURL, "CPA 地址", model.cpaURLInput.View()),
+		model.renderConfigRow(tuiFocusCPAKey, "CPA 密钥", model.cpaKeyInput.View()),
 		model.renderConfigRow(tuiFocusProxy, "代理地址", model.proxyInput.View()),
 		model.renderConfigRow(tuiFocusMailbox, "邮箱目录", model.mailboxInput.View()),
 		model.renderConfigRow(tuiFocusCount, "注册数量", model.countInput.View()+" "+tuiMutedStyle.Render("仅注册 / 注册+授权 生效")),
@@ -812,6 +822,8 @@ func (model *runTUIModel) allInputs() []*textinput.Model {
 		&model.userFileInput,
 		&model.authDirInput,
 		&model.accountsFileInput,
+		&model.cpaURLInput,
+		&model.cpaKeyInput,
 		&model.proxyInput,
 		&model.mailboxInput,
 		&model.countInput,
@@ -838,6 +850,10 @@ func (model *runTUIModel) activeInput() *textinput.Model {
 		return &model.authDirInput
 	case tuiFocusAccountsFile:
 		return &model.accountsFileInput
+	case tuiFocusCPAURL:
+		return &model.cpaURLInput
+	case tuiFocusCPAKey:
+		return &model.cpaKeyInput
 	case tuiFocusProxy:
 		return &model.proxyInput
 	case tuiFocusMailbox:
@@ -873,6 +889,8 @@ func (model *runTUIModel) buildCurrentRunConfig() (config, error) {
 		model.userFileInput.Value(),
 		model.authDirInput.Value(),
 		model.accountsFileInput.Value(),
+		model.cpaURLInput.Value(),
+		model.cpaKeyInput.Value(),
 		model.proxyInput.Value(),
 		model.mailboxInput.Value(),
 		model.countInput.Value(),
@@ -1765,6 +1783,8 @@ func buildTUIRunConfig(
 	userFileValue string,
 	authDirValue string,
 	accountsFileValue string,
+	cpaURLValue string,
+	cpaKeyValue string,
 	proxyValue string,
 	mailboxValue string,
 	countValue string,
@@ -1783,6 +1803,8 @@ func buildTUIRunConfig(
 	cfg.userFile = strings.TrimSpace(userFileValue)
 	cfg.authDir = strings.TrimSpace(authDirValue)
 	cfg.accountsFile = strings.TrimSpace(accountsFileValue)
+	cfg.cpaURL = strings.TrimSpace(cpaURLValue)
+	cfg.cpaKey = strings.TrimSpace(cpaKeyValue)
 	cfg.proxy = strings.TrimSpace(proxyValue)
 	cfg.mailbox = strings.TrimSpace(mailboxValue)
 
@@ -1857,6 +1879,10 @@ func displayFieldName(fieldName string) string {
 		return "授权目录"
 	case "accounts-file":
 		return "状态文件"
+	case "cpa-url":
+		return "CPA 地址"
+	case "cpa-key":
+		return "CPA 密钥"
 	case "proxy":
 		return "代理地址"
 	case "mailbox":
@@ -1918,6 +1944,8 @@ func loadPersistedTUIConfigFromPath(path string, base config) (config, error) {
 	if persisted.AccountsFile != "" {
 		cfg.accountsFile = strings.TrimSpace(persisted.AccountsFile)
 	}
+	cfg.cpaURL = strings.TrimSpace(persisted.CPAURL)
+	cfg.cpaKey = strings.TrimSpace(persisted.CPAKey)
 	cfg.proxy = strings.TrimSpace(persisted.Proxy)
 	if persisted.Mailbox != "" {
 		cfg.mailbox = strings.TrimSpace(persisted.Mailbox)
@@ -1977,6 +2005,8 @@ func savePersistedTUIConfigToPath(path string, cfg config) error {
 		UserFile:         cfg.userFile,
 		AuthDir:          cfg.authDir,
 		AccountsFile:     cfg.accountsFile,
+		CPAURL:           cfg.cpaURL,
+		CPAKey:           cfg.cpaKey,
 		Proxy:            cfg.proxy,
 		Mailbox:          cfg.mailbox,
 		Count:            cfg.count,

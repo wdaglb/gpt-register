@@ -183,6 +183,11 @@ func authorizeAccountWithClient(parent context.Context, cfg config, mailClient *
 			}
 		}
 	}
+	if attempted, err := maybeUploadAuthFileToCPA(parent, cfg, record.Email, result.AuthFilePath); err != nil {
+		logger.Printf("%s CPA 上传失败: %v", prefix, err)
+	} else if attempted {
+		logger.Printf("%s CPA 上传成功: %s", prefix, result.AuthFilePath)
+	}
 
 	logger.Printf("%s 授权成功: %s", prefix, result.AuthFilePath)
 	return authorizationAttemptResult{

@@ -39,6 +39,8 @@ type config struct {
 	userFile                   string
 	authDir                    string
 	accountsFile               string
+	cpaURL                     string
+	cpaKey                     string
 	proxy                      string
 	mailbox                    string
 	count                      int
@@ -159,6 +161,11 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 			return err
 		}
 	}
+	if attempted, err := maybeUploadAuthFileToCPA(loginCtx, cfg, account.email, result.AuthFilePath); err != nil {
+		logger.Printf("%s CPA 上传失败: %v", loginPrefix, err)
+	} else if attempted {
+		logger.Printf("%s CPA 上传成功: %s", loginPrefix, result.AuthFilePath)
+	}
 	logger.Printf("%s 授权文件已生成: %s", loginPrefix, result.AuthFilePath)
 	logger.Printf("%s callback=%s", loginPrefix, result.CallbackURL)
 	return nil
@@ -184,6 +191,8 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.userFile, "user-file", defaultUserFile(), "账号文件路径，支持两行 email/password 或单行 email----password")
 	fs.StringVar(&cfg.authDir, "auth-dir", "auth", "授权文件输出目录")
 	fs.StringVar(&cfg.accountsFile, "accounts-file", "", "账号状态文件路径，默认 accounts.txt")
+	fs.StringVar(&cfg.cpaURL, "cpa-url", envOrDefault("CPA_URL", ""), "CPA 管理地址；配置后授权成功会自动上传 auth 文件")
+	fs.StringVar(&cfg.cpaKey, "cpa-key", envOrDefault("CPA_KEY", ""), "CPA 管理密钥；与 cpa-url 配合使用")
 	fs.StringVar(&cfg.proxy, "proxy", "http://127.0.0.1:7890", "HTTP/HTTPS 代理地址，例如 http://127.0.0.1:7890")
 	fs.StringVar(&cfg.mailbox, "mailbox", "Junk", "验证码轮询优先邮箱目录，默认先查 Junk 再回退 INBOX")
 	fs.IntVar(&cfg.count, "count", 1, "register/pipeline 模式下的注册数量")
@@ -238,6 +247,8 @@ func normalizeConfig(cfg config) (config, error) {
 	if cfg.accountsFile == "" {
 		cfg.accountsFile = "accounts.txt"
 	}
+	cfg.cpaURL = strings.TrimRight(strings.TrimSpace(cfg.cpaURL), "/")
+	cfg.cpaKey = strings.TrimSpace(cfg.cpaKey)
 	if cfg.count <= 0 {
 		return config{}, fmt.Errorf("count 必须大于 0")
 	}

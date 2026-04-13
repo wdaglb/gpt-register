@@ -51,6 +51,8 @@ func TestBuildTUIRunConfig(t *testing.T) {
 		"user.txt",
 		"auth",
 		"accounts.txt",
+		"http://127.0.0.1:8317",
+		"932452",
 		"http://127.0.0.1:7890",
 		"Junk",
 		"20",
@@ -71,6 +73,9 @@ func TestBuildTUIRunConfig(t *testing.T) {
 	if cfg.webMailURL != "http://127.0.0.1:8030" || cfg.email != "demo@example.com" || cfg.password != "password" || cfg.userFile != "user.txt" {
 		t.Fatalf("unexpected config strings: %+v", cfg)
 	}
+	if cfg.cpaURL != "http://127.0.0.1:8317" || cfg.cpaKey != "932452" {
+		t.Fatalf("unexpected CPA config: %+v", cfg)
+	}
 	if cfg.overallTimeout != 5*time.Minute || cfg.otpTimeout != 2*time.Minute || cfg.pollInterval != 5*time.Second || cfg.requestTimeout != 30*time.Second {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
@@ -87,7 +92,7 @@ func TestBuildTUIRunConfigRejectsInvalidValue(t *testing.T) {
 		pollInterval:   3 * time.Second,
 		requestTimeout: 20 * time.Second,
 	}
-	_, err := buildTUIRunConfig(base, modeRegister, base.webMailURL, "", "", "", base.authDir, base.accountsFile, "", base.mailbox, "0", "1", "1", "4m", "90s", "3s", "20s")
+	_, err := buildTUIRunConfig(base, modeRegister, base.webMailURL, "", "", "", base.authDir, base.accountsFile, "", "", "", base.mailbox, "0", "1", "1", "4m", "90s", "3s", "20s")
 	if err == nil {
 		t.Fatal("expected config build error")
 	}
@@ -102,6 +107,8 @@ func TestPersistedTUIConfigRoundTrip(t *testing.T) {
 		userFile:         "user.txt",
 		authDir:          "auth",
 		accountsFile:     "accounts.txt",
+		cpaURL:           "",
+		cpaKey:           "",
 		proxy:            "http://127.0.0.1:7890",
 		mailbox:          "Junk",
 		count:            1,
@@ -120,6 +127,8 @@ func TestPersistedTUIConfigRoundTrip(t *testing.T) {
 		userFile:         "demo.txt",
 		authDir:          "custom-auth",
 		accountsFile:     "custom-accounts.txt",
+		cpaURL:           "http://127.0.0.1:8317",
+		cpaKey:           "secret-key",
 		proxy:            "http://127.0.0.1:8899",
 		mailbox:          "INBOX",
 		count:            12,
@@ -146,6 +155,9 @@ func TestPersistedTUIConfigRoundTrip(t *testing.T) {
 	}
 	if got.webMailURL != want.webMailURL || got.email != want.email || got.password != want.password || got.userFile != want.userFile {
 		t.Fatalf("unexpected persisted strings: %+v", got)
+	}
+	if got.cpaURL != want.cpaURL || got.cpaKey != want.cpaKey {
+		t.Fatalf("unexpected persisted CPA config: %+v", got)
 	}
 	if got.authDir != want.authDir || got.accountsFile != want.accountsFile || got.proxy != want.proxy || got.mailbox != want.mailbox {
 		t.Fatalf("unexpected persisted routing config: %+v", got)
