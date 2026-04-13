@@ -361,6 +361,20 @@ func TestFooterViewContainsEmailPoolSummary(t *testing.T) {
 	}
 }
 
+func TestFooterViewContainsVersion(t *testing.T) {
+	model := newRunTUIModel(config{
+		mode:             modePipeline,
+		workers:          2,
+		authorizeWorkers: 3,
+	}, make(chan struct{}), make(chan config), nil)
+	model.width = 120
+
+	rendered := model.footerView()
+	if !strings.Contains(rendered, "版本 "+appVersion) {
+		t.Fatalf("expected footer to contain version, got %q", rendered)
+	}
+}
+
 func TestUpdateHomePhaseAllowsConfigAfterTaskFinished(t *testing.T) {
 	model := newRunTUIModel(config{
 		mode:             modeRegister,

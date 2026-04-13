@@ -1437,7 +1437,7 @@ func (model *runTUIModel) footerView() string {
 		renderStat("授权成功", model.authorizeSuccess, tuiSuccessStyle),
 		renderStat("授权失败", model.authorizeFail, tuiFailStyle),
 	)
-	hintLine := tuiMutedStyle.Render(model.footerHint())
+	hintLine := model.footerHintLine()
 
 	footer := lipgloss.JoinVertical(lipgloss.Left, statsLine, emailPoolLine, workerLine, hintLine)
 	style := tuiFooterStyle
@@ -1445,6 +1445,27 @@ func (model *runTUIModel) footerView() string {
 		style = style.Width(model.width)
 	}
 	return style.Render(footer)
+}
+
+// footerHintLine 渲染底栏最后一行，把操作提示放左侧、版本号放右侧。
+// Why: 用户需要在右下角稳定看到当前版本，因此这里显式为提示区预留右对齐版本位。
+func (model *runTUIModel) footerHintLine() string {
+	hintText := tuiMutedStyle.Render(model.footerHint())
+	versionText := tuiMutedStyle.Render("版本 " + appVersion)
+	if model.width <= 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Left, hintText, "   ", versionText)
+	}
+
+	innerWidth := model.width - 2
+	if innerWidth <= lipgloss.Width(hintText)+lipgloss.Width(versionText)+1 {
+		return lipgloss.JoinHorizontal(lipgloss.Left, hintText, "   ", versionText)
+	}
+
+	gapWidth := innerWidth - lipgloss.Width(hintText) - lipgloss.Width(versionText)
+	if gapWidth < 1 {
+		gapWidth = 1
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Left, hintText, strings.Repeat(" ", gapWidth), versionText)
 }
 
 // emailPoolSummaryText 返回底部状态栏的邮箱池摘要。
