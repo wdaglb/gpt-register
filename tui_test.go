@@ -341,6 +341,26 @@ func TestFooterViewContainsWorkerSummary(t *testing.T) {
 	}
 }
 
+func TestFooterViewContainsEmailPoolSummary(t *testing.T) {
+	model := newRunTUIModel(config{
+		mode:             modePipeline,
+		workers:          2,
+		authorizeWorkers: 3,
+	}, make(chan struct{}), make(chan config), nil)
+	model.emailPoolStatsLoaded = true
+	model.emailPoolStats = emailPoolStats{
+		Total:     10,
+		Available: 4,
+		Leased:    2,
+		Used:      3,
+	}
+
+	rendered := model.footerView()
+	if !strings.Contains(rendered, "可用=4，已使用=3，未使用=7，租用中=2") {
+		t.Fatalf("expected footer to contain email pool summary, got %q", rendered)
+	}
+}
+
 func TestUpdateHomePhaseAllowsConfigAfterTaskFinished(t *testing.T) {
 	model := newRunTUIModel(config{
 		mode:             modeRegister,

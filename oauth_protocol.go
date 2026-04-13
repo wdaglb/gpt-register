@@ -71,6 +71,7 @@ type flowResultError struct {
 type protocolClient struct {
 	httpClient tls_client.HttpClient
 	userAgent  string
+	logf       func(string, ...any)
 }
 
 type httpResult struct {
@@ -180,7 +181,7 @@ type htmlForm struct {
 // loginWithProtocol 执行已有账号的纯协议 OAuth 登录闭环。
 // 核心流程：初始化前端会话 -> 提交邮箱/密码 -> 处理邮箱 OTP -> 交换 token -> 生成本地 auth 文件。
 func loginWithProtocol(parent context.Context, cfg config, account loginAccount, mailClient *webMailClient, logger *log.Logger) (*protocolLoginResult, error) {
-	httpClient, err := newProtocolClient(cfg)
+	httpClient, err := newProtocolClient(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +212,7 @@ func loginWithProtocol(parent context.Context, cfg config, account loginAccount,
 
 // newProtocolClient 创建带 Chrome TLS 指纹和共享 Cookie Jar 的客户端。
 // Why: OpenAI 当前链路对 TLS 指纹、Cookie 连续性都较敏感，因此这里显式模拟同一浏览器会话。
-func newProtocolClient(cfg config) (*protocolClient, error) {
+func newProtocolClient(cfg config, logger *log.Logger) (*protocolClient, error) {
 	jar := tls_client.NewCookieJar()
 	options := []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(int(cfg.requestTimeout.Seconds())),
@@ -231,6 +232,11 @@ func newProtocolClient(cfg config) (*protocolClient, error) {
 	return &protocolClient{
 		httpClient: client,
 		userAgent:  defaultOAuthUserAgent,
+		logf: func(format string, args ...any) {
+			if logger != nil {
+				logger.Printf(format, args...)
+			}
+		},
 	}, nil
 }
 
@@ -310,7 +316,16 @@ func (c *protocolClient) completeOAuth(ctx context.Context, cfg config, account 
 		defer cancel()
 
 		// Why: 邮件服务的时间戳精度只有秒，而本地 time.Now() 带毫秒；给一个回看窗口，避免刚发出的 OTP 被误判为“旧邮件”。
-		code, err := mailClient.waitCodeByEmail(waitCtx, account.email, cfg.mailbox, cfg.pollInterval, time.Now().UTC().Add(-15*time.Second))
+		code, err := mailClient.waitCodeByEmail(
+			waitCtx,
+			account.email,
+			cfg.mailbox,
+			cfg.pollInterval,
+			time.Now().UTC().Add(-15*time.Second),
+			func(elapsed time.Duration) {
+				logger.Printf("等待授权邮箱验证码 %s...", elapsed.Truncate(time.Second))
+			},
+		)
 		if err != nil {
 			return nil, fmt.Errorf("等待邮箱验证码失败: %w", err)
 		}
@@ -1425,7 +1440,13 @@ func (c *protocolClient) doRequest(ctx context.Context, options requestOptions) 
 	req.Header = buildBrowserHeaders(options, c.userAgent)
 
 	c.httpClient.SetFollowRedirect(options.AllowRedirect)
-	resp, err := c.httpClient.Do(req)
+	requestLabel := "OpenAI请求 " + formatHTTPRequestLabel(options.Method, options.URL)
+	var resp *http.Response
+	err = runWithWaitLog(ctx, waitLogFunc(c.logf, requestLabel), func() error {
+		var requestErr error
+		resp, requestErr = c.httpClient.Do(req)
+		return requestErr
+	})
 	if err != nil {
 		return nil, err
 	}

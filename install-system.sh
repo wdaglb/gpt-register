@@ -169,9 +169,14 @@ extract_binary() {
 }
 
 install_binary() {
+  local target_binary="${APP_DIR}/${BINARY_NAME}"
   mkdir -p "${APP_DIR}"
-  install -m 0755 "${EXTRACTED_BINARY}" "${APP_DIR}/${BINARY_NAME}"
-  log "二进制已安装到: ${APP_DIR}/${BINARY_NAME}"
+  if [[ -f "${target_binary}" ]]; then
+    log "检测到已存在二进制，执行覆盖安装: ${target_binary}"
+    rm -f "${target_binary}"
+  fi
+  install -m 0755 "${EXTRACTED_BINARY}" "${target_binary}"
+  log "二进制已安装到: ${target_binary}"
 }
 
 prepare_runtime_files() {

@@ -17,6 +17,14 @@ type authorizationAttemptResult struct {
 	Err          error
 }
 
+// authorizationSummary 汇总授权阶段的成功/失败计数与首个错误。
+// Why: pipeline 需要边消费结果边跑 worker，最后再统一收敛统计，避免结果通道无人消费导致死锁。
+type authorizationSummary struct {
+	success  int
+	fail     int
+	firstErr error
+}
+
 // runAuthorizeFromAccounts 从 accounts.txt 中提取待授权账号并批量执行授权。
 func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	pending, err := store.listPendingAuthorization()
@@ -37,9 +45,13 @@ func runAuthorizeFromAccounts(parent context.Context, cfg config, mailClient *we
 func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
 	authorizeJobs := make(chan accountRecord, maxInt(cfg.authorizeWorkers*2, 1))
 	authorizeResults := make(chan authorizationAttemptResult, maxInt(cfg.authorizeWorkers*2, 1))
+	summaryCh := make(chan authorizationSummary, 1)
 
 	var authorizeWG sync.WaitGroup
 	startAuthorizeWorkers(parent, cfg, mailClient, logger, store, ui, cfg.authorizeWorkers, authorizeJobs, authorizeResults, &authorizeWG)
+	go func() {
+		summaryCh <- collectAuthorizationResults(authorizeResults, logger, "pipeline ")
+	}()
 
 	registerErr := runRegisterUntilTargetSuccess(parent, cfg, mailClient, logger, store, ui, authorizeJobs)
 	if registerErr == nil {
@@ -48,31 +60,17 @@ func runPipeline(parent context.Context, cfg config, mailClient *webMailClient, 
 	close(authorizeJobs)
 	authorizeWG.Wait()
 	close(authorizeResults)
+	summary := <-summaryCh
 
-	success := 0
-	fail := 0
-	var firstErr error
-	for result := range authorizeResults {
-		if isAuthorizationSuccessful(result) {
-			success++
-			continue
-		}
-		fail++
-		logger.Printf("pipeline 授权失败账号=%s status=%s err=%v", result.Email, result.OAuthStatus, result.Err)
-		if firstErr == nil && result.Err != nil {
-			firstErr = result.Err
-		}
-	}
-
-	logger.Printf("pipeline 授权阶段结束: success=%d fail=%d", success, fail)
-	if registerErr != nil && firstErr != nil {
-		return fmt.Errorf("注册阶段失败: %w；授权阶段失败: %v", registerErr, firstErr)
+	logger.Printf("pipeline 授权阶段结束: success=%d fail=%d", summary.success, summary.fail)
+	if registerErr != nil && summary.firstErr != nil {
+		return fmt.Errorf("注册阶段失败: %w；授权阶段失败: %v", registerErr, summary.firstErr)
 	}
 	if registerErr != nil {
 		return registerErr
 	}
-	if firstErr != nil {
-		return firstErr
+	if summary.firstErr != nil {
+		return summary.firstErr
 	}
 	return nil
 }
@@ -90,25 +88,11 @@ func runAuthorizeRecords(parent context.Context, cfg config, mailClient *webMail
 	close(jobs)
 	workers.Wait()
 	close(results)
+	summary := collectAuthorizationResults(results, logger, "")
 
-	success := 0
-	fail := 0
-	var firstErr error
-	for result := range results {
-		if isAuthorizationSuccessful(result) {
-			success++
-			continue
-		}
-		fail++
-		logger.Printf("授权失败账号=%s status=%s err=%v", result.Email, result.OAuthStatus, result.Err)
-		if firstErr == nil && result.Err != nil {
-			firstErr = result.Err
-		}
-	}
-
-	logger.Printf("授权任务结束: success=%d fail=%d", success, fail)
-	if success == 0 && fail > 0 && firstErr != nil {
-		return fmt.Errorf("全部授权失败: %w", firstErr)
+	logger.Printf("授权任务结束: success=%d fail=%d", summary.success, summary.fail)
+	if summary.success == 0 && summary.fail > 0 && summary.firstErr != nil {
+		return fmt.Errorf("全部授权失败: %w", summary.firstErr)
 	}
 	return nil
 }
@@ -138,6 +122,24 @@ func startAuthorizeWorkers(parent context.Context, cfg config, mailClient *webMa
 // Why: 只有 OAuth 结果为 ok 且整条 worker 没有返回错误时，TUI 统计和批量汇总才能保持一致。
 func isAuthorizationSuccessful(result authorizationAttemptResult) bool {
 	return result.Err == nil && isOAuthSuccessful(result.OAuthStatus)
+}
+
+// collectAuthorizationResults 统一消费授权结果通道并汇总统计。
+// Why: pipeline 模式必须在 worker 运行期间实时 drain 结果通道，否则缓冲打满后会把授权 worker 整体堵住。
+func collectAuthorizationResults(results <-chan authorizationAttemptResult, logger *log.Logger, failurePrefix string) authorizationSummary {
+	summary := authorizationSummary{}
+	for result := range results {
+		if isAuthorizationSuccessful(result) {
+			summary.success++
+			continue
+		}
+		summary.fail++
+		logger.Printf("%s授权失败账号=%s status=%s err=%v", failurePrefix, result.Email, result.OAuthStatus, result.Err)
+		if summary.firstErr == nil && result.Err != nil {
+			summary.firstErr = result.Err
+		}
+	}
+	return summary
 }
 
 // runAuthorizeAttempt 负责单个账号的一次 OAuth 授权尝试，并把结果回写到 accounts.txt。

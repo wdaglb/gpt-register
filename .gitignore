@@ -1,3 +1,5 @@
+.idea/
+.gocache/
 artifacts/
 auth/
 user.txt

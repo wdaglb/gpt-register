@@ -98,6 +98,12 @@ func run(parent context.Context, args []string) (bool, error) {
 // executeMode 统一分发各运行模式，避免普通日志模式和 TUI 模式复制一份业务入口。
 // Why: UI 渲染只是表现层差异，真正的注册/授权逻辑应共用同一条调度链路，避免后续改业务时漏改某个入口。
 func executeMode(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI) error {
+	if store != nil {
+		store.setWaitLogger(logger)
+	}
+	if mailClient != nil && logger != nil {
+		mailClient.setWaitLogger(logger.Printf)
+	}
 	switch cfg.mode {
 	case modeRegister:
 		return runRegister(parent, cfg, mailClient, logger, store, ui, nil)

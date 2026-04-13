@@ -106,9 +106,14 @@ extract_binary() {
 }
 
 install_binary() {
+  local target_binary="${INSTALL_DIR}/${BINARY_NAME}"
   mkdir -p "${INSTALL_DIR}"
-  install -m 0755 "${EXTRACTED_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
-  log "二进制已安装到: ${INSTALL_DIR}/${BINARY_NAME}"
+  if [[ -f "${target_binary}" ]]; then
+    log "检测到已存在二进制，执行覆盖安装: ${target_binary}"
+    rm -f "${target_binary}"
+  fi
+  install -m 0755 "${EXTRACTED_BINARY}" "${target_binary}"
+  log "二进制已安装到: ${target_binary}"
 
   if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
     warn "INSTALL_DIR 未加入 PATH，当前会话请使用完整路径运行"

@@ -275,7 +275,7 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 	prefix := fmt.Sprintf("[worker-%d][%s]", workerID, lease.Email)
 	logger.Printf("%s 已租到邮箱 account_id=%d", prefix, lease.ID)
 
-	client, err := newProtocolClient(cfg)
+	client, err := newProtocolClient(cfg, logger)
 	if err != nil {
 		result.Err = fmt.Errorf("创建协议客户端失败: %w", err)
 		result.Reason = "client_init"
@@ -331,7 +331,9 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 			return result
 		}
 		if authorizeJobs != nil {
-			authorizeJobs <- record
+			if !enqueueAuthorizeJob(attemptCtx, logger, prefix, authorizeJobs, record) {
+				logger.Printf("%s 授权队列投递中断，账号仍保留为 oauth=pending，可后续补授权", prefix)
+			}
 		}
 	}
 	markUsedWithCleanup(cfg, mailClient, lease, logger, prefix)
@@ -374,7 +376,16 @@ func (c *protocolClient) registerWithProtocol(ctx context.Context, cfg config, l
 	defer cancel()
 
 	// Why: web_mail 时间戳精度只有秒，回看 15 秒可以避免刚触发的验证码被误判成旧邮件。
-	code, err := mailClient.waitCodeByAccount(waitCtx, lease.ID, cfg.mailbox, cfg.pollInterval, time.Now().UTC().Add(-15*time.Second))
+	code, err := mailClient.waitCodeByAccount(
+		waitCtx,
+		lease.ID,
+		cfg.mailbox,
+		cfg.pollInterval,
+		time.Now().UTC().Add(-15*time.Second),
+		func(elapsed time.Duration) {
+			logger.Printf("%s 等待注册邮箱验证码 %s...", prefix, elapsed.Truncate(time.Second))
+		},
+	)
 	if err != nil {
 		return newFlowResultError("otp_wait", fmt.Errorf("等待邮箱验证码失败: %w", err))
 	}
@@ -720,7 +731,9 @@ func returnAccountWithCleanup(cfg config, mailClient *webMailClient, lease *webM
 	defer cancel()
 
 	// Why: 主流程上下文可能已经因超时取消，归还租约必须脱离主链路单独兜底，否则邮箱会长期卡在 leased 状态。
-	if err := mailClient.returnAccount(cleanupCtx, lease.ID, lease.LeaseToken); err != nil {
+	if err := runWithWaitLog(cleanupCtx, waitLogFunc(logger.Printf, prefix+" 归还邮箱"), func() error {
+		return mailClient.returnAccount(cleanupCtx, lease.ID, lease.LeaseToken)
+	}); err != nil {
 		logger.Printf("%s 归还邮箱失败: %v", prefix, err)
 	}
 }
@@ -730,7 +743,9 @@ func markUsedWithCleanup(cfg config, mailClient *webMailClient, lease *webMailAc
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout(cfg))
 	defer cancel()
 
-	if err := mailClient.markUsed(cleanupCtx, lease.ID, lease.LeaseToken); err != nil {
+	if err := runWithWaitLog(cleanupCtx, waitLogFunc(logger.Printf, prefix+" 标记邮箱已使用"), func() error {
+		return mailClient.markUsed(cleanupCtx, lease.ID, lease.LeaseToken)
+	}); err != nil {
 		logger.Printf("%s 标记邮箱已使用失败: %v", prefix, err)
 	}
 }
@@ -741,6 +756,27 @@ func cleanupTimeout(cfg config) time.Duration {
 		return cfg.requestTimeout
 	}
 	return 20 * time.Second
+}
+
+// enqueueAuthorizeJob 在 pipeline 模式下把新注册账号投递给授权 worker。
+// Why: 当授权侧暂时处理不过来时，这里是注册线程最容易“看起来卡死”的点，因此需要显式打印等待日志。
+func enqueueAuthorizeJob(ctx context.Context, logger *log.Logger, prefix string, jobs chan<- accountRecord, record accountRecord) bool {
+	waitTicker := time.NewTicker(time.Second)
+	defer waitTicker.Stop()
+
+	waited := time.Duration(0)
+	for {
+		select {
+		case jobs <- record:
+			return true
+		case <-ctx.Done():
+			logger.Printf("%s 等待授权队列时中断: %v", prefix, ctx.Err())
+			return false
+		case <-waitTicker.C:
+			waited += time.Second
+			logger.Printf("%s 等待授权队列 %s...", prefix, waited)
+		}
+	}
 }
 
 // generateRegistrationPassword 生成与参考脚本兼容的注册密码格式。

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,12 +27,28 @@ type accountRecord struct {
 // accountsStore 负责线程安全地读写 accounts.txt。
 // Why: 注册线程和授权线程都可能同时更新同一文件，这里同时使用进程内互斥锁和文件锁，避免出现内容互相覆盖或半行写入。
 type accountsStore struct {
-	path string
-	mu   sync.Mutex
+	path       string
+	mu         sync.Mutex
+	waitLogger func(string, time.Duration)
 }
 
 func newAccountsStore(path string) *accountsStore {
 	return &accountsStore{path: filepath.Clean(path)}
+}
+
+// setWaitLogger 为 accounts 文件锁等待设置日志输出。
+// Why: 运行期 logger 只有在 executeMode/runWithTUI 内才确定，因此 store 需要允许后注入日志器。
+func (s *accountsStore) setWaitLogger(logger *log.Logger) {
+	if s == nil {
+		return
+	}
+	if logger == nil {
+		s.waitLogger = nil
+		return
+	}
+	s.waitLogger = func(resource string, elapsed time.Duration) {
+		logger.Printf("等待%s %s...", resource, elapsed.Truncate(time.Second))
+	}
 }
 
 // upsertRegistration 写入或更新账号的注册结果。
@@ -169,7 +186,9 @@ func (s *accountsStore) mutate(mutator func([]accountRecord) ([]accountRecord, e
 }
 
 func (s *accountsStore) withLockedFile(fn func() error) error {
-	s.mu.Lock()
+	lockMutexWithProgress(&s.mu, func(elapsed time.Duration) {
+		s.logWaitProgress("accounts 进程内锁", elapsed)
+	})
 	defer s.mu.Unlock()
 
 	lockPath := s.path + ".lock"
@@ -185,7 +204,9 @@ func (s *accountsStore) withLockedFile(fn func() error) error {
 		_ = lockFile.Close()
 	}()
 
-	if err := lockFileExclusive(lockFile); err != nil {
+	if err := lockFileExclusiveWithProgress(lockFile, func(elapsed time.Duration) {
+		s.logWaitProgress("accounts 文件锁", elapsed)
+	}); err != nil {
 		return fmt.Errorf("锁定 accounts 文件失败: %w", err)
 	}
 	defer func() {
@@ -193,6 +214,13 @@ func (s *accountsStore) withLockedFile(fn func() error) error {
 	}()
 
 	return fn()
+}
+
+func (s *accountsStore) logWaitProgress(resource string, elapsed time.Duration) {
+	if s == nil || s.waitLogger == nil {
+		return
+	}
+	s.waitLogger(resource, elapsed)
 }
 
 func (s *accountsStore) loadRecordsUnlocked() ([]accountRecord, error) {

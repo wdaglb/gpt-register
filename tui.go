@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	maxTUILogLines    = 80
-	tuiConfigFile     = ".config.json"
-	tuiSystemCardID   = "system"
-	tuiRunningCardGap = 1
+	maxTUILogLines                   = 80
+	tuiConfigFile                    = ".config.json"
+	tuiSystemCardID                  = "system"
+	tuiRunningCardGap                = 1
+	tuiEmailPoolStatsRefreshInterval = 5 * time.Second
 
 	tuiFocusMode = iota
 	tuiFocusWebMailURL
@@ -258,6 +259,13 @@ type tuiAuthorizeFinishMsg struct {
 	Success bool
 }
 
+type tuiEmailPoolStatsMsg struct {
+	Stats emailPoolStats
+	Err   error
+}
+
+type tuiEmailPoolStatsTickMsg struct{}
+
 type tuiFinishedMsg struct{}
 
 // tuiPersistentConfig 只持久化 TUI 页面负责维护的关键运行参数。
@@ -299,9 +307,10 @@ type tuiLogCard struct {
 // runTUIModel 描述配置页、worker 卡片列表与底部统计栏的完整状态。
 // Why: 现在 TUI 同时承担“配置入口”和“运行期监控”两种职责，统一模型可以保证界面切换时状态连续。
 type runTUIModel struct {
-	baseConfig config
-	ready      chan struct{}
-	startCh    chan<- config
+	baseConfig  config
+	ready       chan struct{}
+	startCh     chan<- config
+	statsClient func(config) *webMailClient
 
 	phase      tuiPhase
 	started    bool
@@ -346,6 +355,10 @@ type runTUIModel struct {
 
 	registerStartedAt  time.Time
 	registerFinishedAt time.Time
+
+	emailPoolStats       emailPoolStats
+	emailPoolStatsLoaded bool
+	emailPoolStatsError  string
 }
 
 func newRunTUIModel(cfg config, ready chan struct{}, startCh chan<- config, loadErr error) *runTUIModel {
@@ -353,9 +366,12 @@ func newRunTUIModel(cfg config, ready chan struct{}, startCh chan<- config, load
 	logViewport.MouseWheelEnabled = true
 
 	model := &runTUIModel{
-		baseConfig:            cfg,
-		ready:                 ready,
-		startCh:               startCh,
+		baseConfig: cfg,
+		ready:      ready,
+		startCh:    startCh,
+		statsClient: func(currentCfg config) *webMailClient {
+			return newWebMailClient(currentCfg.webMailURL, currentCfg.requestTimeout)
+		},
 		phase:                 tuiPhaseHome,
 		modeIndex:             tuiModeIndex(cfg.mode),
 		focusIndex:            tuiFocusMode,
@@ -387,10 +403,14 @@ func newRunTUIModel(cfg config, ready chan struct{}, startCh chan<- config, load
 }
 
 func (model *runTUIModel) Init() tea.Cmd {
-	return func() tea.Msg {
-		close(model.ready)
-		return nil
-	}
+	return tea.Batch(
+		func() tea.Msg {
+			close(model.ready)
+			return nil
+		},
+		model.fetchEmailPoolStatsCmd(model.baseConfig),
+		model.emailPoolStatsTickCmd(),
+	)
 }
 
 func (model *runTUIModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -430,6 +450,22 @@ func (model *runTUIModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		model.syncViewportLayout()
 		return model, nil
+	case tuiEmailPoolStatsMsg:
+		if msg.Err != nil {
+			model.emailPoolStatsLoaded = false
+			model.emailPoolStatsError = msg.Err.Error()
+		} else {
+			model.emailPoolStats = msg.Stats
+			model.emailPoolStatsLoaded = true
+			model.emailPoolStatsError = ""
+		}
+		model.syncViewportLayout()
+		return model, nil
+	case tuiEmailPoolStatsTickMsg:
+		return model, tea.Batch(
+			model.fetchEmailPoolStatsCmd(model.baseConfig),
+			model.emailPoolStatsTickCmd(),
+		)
 	case tuiFinishedMsg:
 		model.running = false
 		model.finished = true
@@ -916,7 +952,7 @@ func (model *runTUIModel) startRun() tea.Cmd {
 	case model.startCh <- runCfg:
 	default:
 	}
-	return nil
+	return model.fetchEmailPoolStatsCmd(runCfg)
 }
 
 // resetRunMetrics 在每次重新启动前清空统计，避免多轮任务的成功/失败数相互叠加。
@@ -1382,6 +1418,11 @@ func (model *runTUIModel) configCardWidth() int {
 }
 
 func (model *runTUIModel) footerView() string {
+	emailPoolLine := lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		tuiMutedStyle.Render("邮箱池 "),
+		tuiValueStyle.Render(model.emailPoolSummaryText()),
+	)
 	workerLine := lipgloss.JoinHorizontal(
 		lipgloss.Left,
 		tuiMutedStyle.Render("线程 "),
@@ -1398,12 +1439,69 @@ func (model *runTUIModel) footerView() string {
 	)
 	hintLine := tuiMutedStyle.Render(model.footerHint())
 
-	footer := lipgloss.JoinVertical(lipgloss.Left, statsLine, workerLine, hintLine)
+	footer := lipgloss.JoinVertical(lipgloss.Left, statsLine, emailPoolLine, workerLine, hintLine)
 	style := tuiFooterStyle
 	if model.width > 0 {
 		style = style.Width(model.width)
 	}
 	return style.Render(footer)
+}
+
+// emailPoolSummaryText 返回底部状态栏的邮箱池摘要。
+// Why: 非 webmail 模式启动时需要快速看到“可用 / 已使用 / 未使用 / 租用中”，避免用户还要额外手查 stats 接口。
+func (model *runTUIModel) emailPoolSummaryText() string {
+	if model.emailPoolStatsLoaded {
+		unused := model.emailPoolStats.Total - model.emailPoolStats.Used
+		if unused < 0 {
+			unused = 0
+		}
+		return fmt.Sprintf(
+			"可用=%d，已使用=%d，未使用=%d，租用中=%d",
+			model.emailPoolStats.Available,
+			model.emailPoolStats.Used,
+			unused,
+			model.emailPoolStats.Leased,
+		)
+	}
+	if model.emailPoolStatsError != "" {
+		return "获取失败"
+	}
+	return "读取中..."
+}
+
+// fetchEmailPoolStatsCmd 异步拉取当前邮箱池统计。
+// Why: stats 接口依赖本地 web_mail 服务，必须异步请求，避免 TUI 初始化或开始按钮阻塞界面。
+func (model *runTUIModel) fetchEmailPoolStatsCmd(cfg config) tea.Cmd {
+	if model == nil || model.statsClient == nil || cfg.mode == modeWebMail || strings.TrimSpace(cfg.webMailURL) == "" {
+		return nil
+	}
+
+	return func() tea.Msg {
+		client := model.statsClient(cfg)
+		if client == nil {
+			return tuiEmailPoolStatsMsg{}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.requestTimeout)
+		defer cancel()
+
+		stats, err := client.getStats(ctx)
+		return tuiEmailPoolStatsMsg{
+			Stats: stats,
+			Err:   err,
+		}
+	}
+}
+
+// emailPoolStatsTickCmd 周期性触发邮箱池统计刷新。
+// Why: 启动后邮箱池状态会持续变化，只在初始化和开始运行时拉一次会很快过期，因此需要低频自动刷新。
+func (model *runTUIModel) emailPoolStatsTickCmd() tea.Cmd {
+	if model == nil {
+		return nil
+	}
+	return tea.Tick(tuiEmailPoolStatsRefreshInterval, func(time.Time) tea.Msg {
+		return tuiEmailPoolStatsTickMsg{}
+	})
 }
 
 // workerSummaryText 返回底部状态栏里展示的 worker 数量摘要。

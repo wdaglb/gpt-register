@@ -158,10 +158,11 @@ type emailPoolFileSignature struct {
 // emailPoolStore 负责把 emails.txt 当作唯一数据库进行读写。
 // Why: 改成 txt 持久化后，正确性取决于“进程内互斥 + 文件锁 + 原子替换写入”三层同时生效，否则多请求并发时很容易把状态写乱。
 type emailPoolStore struct {
-	path      string
-	mu        sync.Mutex
-	records   []emailPoolRecord
-	signature *emailPoolFileSignature
+	path       string
+	mu         sync.Mutex
+	records    []emailPoolRecord
+	signature  *emailPoolFileSignature
+	waitLogger func(string, time.Duration)
 }
 
 // upstreamMailClient 负责请求上游邮件接口拉取最新邮件。
@@ -169,6 +170,7 @@ type emailPoolStore struct {
 type upstreamMailClient struct {
 	baseURL string
 	client  *http.Client
+	logf    func(string, ...any)
 }
 
 // emailPoolService 托管自动同步、租约回收与 HTTP 路由分发。
@@ -339,13 +341,30 @@ func newEmailPoolStore(path string) (*emailPoolStore, error) {
 	}, nil
 }
 
+// setWaitLogger 为 emails.txt 锁等待设置日志输出。
+// Why: web_mail 的慢请求经常本质上卡在文件锁，带上服务 logger 后才能直接看到是“在等锁”而不是“接口没响应”。
+func (store *emailPoolStore) setWaitLogger(logger *log.Logger) {
+	if store == nil {
+		return
+	}
+	if logger == nil {
+		store.waitLogger = nil
+		return
+	}
+	store.waitLogger = func(resource string, elapsed time.Duration) {
+		logger.Printf("等待%s %s...", resource, elapsed.Truncate(time.Second))
+	}
+}
+
 // Close 为了兼容原调用点保留，txt 存储当前无需释放额外资源。
 func (store *emailPoolStore) Close() error {
 	return nil
 }
 
 func (store *emailPoolStore) withLockedFile(callback func() error) error {
-	store.mu.Lock()
+	lockMutexWithProgress(&store.mu, func(elapsed time.Duration) {
+		store.logWaitProgress("web_mail 进程内锁", elapsed)
+	})
 	defer store.mu.Unlock()
 
 	lockPath := store.path + ".lock"
@@ -361,7 +380,9 @@ func (store *emailPoolStore) withLockedFile(callback func() error) error {
 		_ = lockFile.Close()
 	}()
 
-	if err := lockFileExclusive(lockFile); err != nil {
+	if err := lockFileExclusiveWithProgress(lockFile, func(elapsed time.Duration) {
+		store.logWaitProgress("web_mail 文件锁", elapsed)
+	}); err != nil {
 		return fmt.Errorf("锁定 web_mail 文件失败: %w", err)
 	}
 	defer func() {
@@ -369,6 +390,13 @@ func (store *emailPoolStore) withLockedFile(callback func() error) error {
 	}()
 
 	return callback()
+}
+
+func (store *emailPoolStore) logWaitProgress(resource string, elapsed time.Duration) {
+	if store == nil || store.waitLogger == nil {
+		return
+	}
+	store.waitLogger(resource, elapsed)
 }
 
 // syncFromFile 把 emails.txt 同步到内存快照。
@@ -1066,6 +1094,15 @@ func newUpstreamMailClient(baseURL string, timeout time.Duration) *upstreamMailC
 	}
 }
 
+// setWaitLogger 为上游取信请求设置等待日志输出。
+// Why: web_mail 有时不是卡在本地文件锁，而是卡在外部取信 HTTP；这里单独接日志才能区分本地锁和上游网络。
+func (client *upstreamMailClient) setWaitLogger(logf func(string, ...any)) {
+	if client == nil {
+		return
+	}
+	client.logf = logf
+}
+
 // fetchLatestMail 根据 refresh_token/client_id/email 查询最新邮件。
 // Why: web_mail 服务的本质是把邮箱租约和取信逻辑组装成一个本地 HTTP 服务，因此上游取信必须由服务端统一代理。
 func (client *upstreamMailClient) fetchLatestMail(ctx context.Context, record emailPoolRecord, mailbox string) (map[string]any, error) {
@@ -1090,7 +1127,13 @@ func (client *upstreamMailClient) fetchLatestMail(ctx context.Context, record em
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "web_mail/1.0")
 
-	response, err := client.client.Do(request)
+	requestLabel := "上游邮件请求 " + formatHTTPRequestLabel(http.MethodGet, requestURL)
+	var response *http.Response
+	err = runWithWaitLog(ctx, waitLogFunc(client.logf, requestLabel), func() error {
+		var requestErr error
+		response, requestErr = client.client.Do(request)
+		return requestErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("请求上游邮件接口失败: %w", err)
 	}
@@ -1125,6 +1168,12 @@ func newEmailPoolService(store *emailPoolStore, emailsFile string, mailClient *u
 	// Why: 单测和局部复用场景不一定会显式注入 logger，这里统一兜底到 discard，避免关键日志调用散落空指针判断。
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
+	}
+	if store != nil {
+		store.setWaitLogger(logger)
+	}
+	if mailClient != nil {
+		mailClient.setWaitLogger(logger.Printf)
 	}
 	return &emailPoolService{
 		store:               store,
