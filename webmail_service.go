@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go-register/utils"
 )
 
 const (
@@ -1127,9 +1129,9 @@ func (client *upstreamMailClient) fetchLatestMail(ctx context.Context, record em
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("User-Agent", "web_mail/1.0")
 
-	requestLabel := "上游邮件请求 " + formatHTTPRequestLabel(http.MethodGet, requestURL)
+	requestLabel := "上游邮件请求 " + utils.FormatHTTPRequestLabel(http.MethodGet, requestURL)
 	var response *http.Response
-	err = runWithWaitLog(ctx, waitLogFunc(client.logf, requestLabel), func() error {
+	err = utils.RunWithWaitLog(ctx, utils.WaitLogFunc(client.logf, requestLabel), func() error {
 		var requestErr error
 		response, requestErr = client.client.Do(request)
 		return requestErr

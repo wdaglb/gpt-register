@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"go-register/utils"
 )
 
 var otpPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{6})(?:[^0-9]|$)`)
@@ -161,7 +163,7 @@ func (c *webMailClient) waitCodeByAccount(ctx context.Context, accountID int, ma
 			return "", fmt.Errorf("验证码轮询超时")
 		}
 
-		maybeReportWaitProgress(waitStartedAt, &lastReported, waitProgressInterval, onProgress)
+		utils.MaybeReportWaitProgress(waitStartedAt, &lastReported, waitProgressInterval, onProgress)
 		if err := sleepContext(ctx, pollInterval); err != nil {
 			if lastErr != nil {
 				return "", fmt.Errorf("验证码轮询结束，最后一次错误: %w", lastErr)
@@ -215,7 +217,7 @@ func (c *webMailClient) waitCodeByEmail(ctx context.Context, email, mailbox stri
 			return "", fmt.Errorf("验证码轮询超时")
 		}
 
-		maybeReportWaitProgress(waitStartedAt, &lastReported, waitProgressInterval, onProgress)
+		utils.MaybeReportWaitProgress(waitStartedAt, &lastReported, waitProgressInterval, onProgress)
 		if err := sleepContext(ctx, pollInterval); err != nil {
 			if lastErr != nil {
 				return "", fmt.Errorf("验证码轮询结束，最后一次错误: %w", lastErr)
@@ -251,9 +253,9 @@ func (c *webMailClient) request(ctx context.Context, method, path string, query 
 	}
 	req.Header.Set("Accept", "application/json")
 
-	requestLabel := "web_mail请求 " + formatHTTPRequestLabel(method, fullURL)
+	requestLabel := "web_mail请求 " + utils.FormatHTTPRequestLabel(method, fullURL)
 	var resp *http.Response
-	err = runWithWaitLog(ctx, waitLogFunc(c.logf, requestLabel), func() error {
+	err = utils.RunWithWaitLog(ctx, utils.WaitLogFunc(c.logf, requestLabel), func() error {
 		var requestErr error
 		resp, requestErr = c.client.Do(req)
 		return requestErr
@@ -364,22 +366,4 @@ func sleepContext(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-// maybeReportWaitProgress 在长轮询场景下按固定间隔输出“仍在等待”的心跳。
-// Why: 用户反馈注册/授权线程看起来会“卡住不动”，这里把等待进度显式打到日志里，
-// 让运维能区分“仍在轮询验证码”和“线程真的挂死”两类问题。
-func maybeReportWaitProgress(startedAt time.Time, lastReported *time.Duration, interval time.Duration, onProgress func(time.Duration)) {
-	if onProgress == nil || interval <= 0 || startedAt.IsZero() || lastReported == nil {
-		return
-	}
-
-	elapsed := time.Since(startedAt)
-	reported := (elapsed / interval) * interval
-	if reported < interval || reported <= *lastReported {
-		return
-	}
-
-	*lastReported = reported
-	onProgress(reported)
 }

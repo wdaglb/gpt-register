@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"go-register/utils"
 )
 
 const (
@@ -78,7 +80,7 @@ func waitWithProgress(tryAcquire func() (bool, error), onProgress func(time.Dura
 			return nil
 		}
 
-		maybeReportWaitProgress(startedAt, &lastReported, lockWaitProgressInterval, onProgress)
+		utils.MaybeReportWaitProgress(startedAt, &lastReported, lockWaitProgressInterval, onProgress)
 		time.Sleep(lockWaitRetryInterval)
 	}
 }

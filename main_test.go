@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"regexp"
+	"strings"
+	"testing"
+
+	"go-register/utils"
+)
 
 func TestExtractOTP(t *testing.T) {
 	t.Parallel()
@@ -84,5 +90,83 @@ func TestNeedsEmailOTP(t *testing.T) {
 		if !needsEmailOTP(input) {
 			t.Fatalf("needsEmailOTP(%q) = false, want true", input)
 		}
+	}
+}
+
+func TestResolveRuntimeProxyConfigReplacesPlaceholder(t *testing.T) {
+	cfg := config{
+		proxy: "http://user-{}:pass@proxy.example.com:8888",
+	}
+
+	resolved := cfg
+	resolved.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+	if strings.Contains(resolved.proxy, "{}") {
+		t.Fatalf("expected placeholder replaced, got %q", resolved.proxy)
+	}
+	if !strings.HasPrefix(resolved.proxy, "http://user-") || !strings.Contains(resolved.proxy, ":pass@proxy.example.com:8888") {
+		t.Fatalf("unexpected proxy format: %q", resolved.proxy)
+	}
+
+	matcher := regexp.MustCompile(`^http://user-([A-Za-z0-9]+):pass@proxy\.example\.com:8888$`)
+	matches := matcher.FindStringSubmatch(resolved.proxy)
+	if len(matches) != 2 {
+		t.Fatalf("expected alphanumeric session key, got %q", resolved.proxy)
+	}
+	if len(matches[1]) != 12 {
+		t.Fatalf("expected session key length 12, got %d", len(matches[1]))
+	}
+}
+
+func TestResolveRuntimeProxyConfigUsesSingleSessionKeyPerRun(t *testing.T) {
+	cfg := config{
+		proxy: "http://user-{}:pass-{}@proxy.example.com:8888",
+	}
+
+	resolved := cfg
+	resolved.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+	matcher := regexp.MustCompile(`^http://user-([A-Za-z0-9]+):pass-([A-Za-z0-9]+)@proxy\.example\.com:8888$`)
+	matches := matcher.FindStringSubmatch(resolved.proxy)
+	if len(matches) != 3 {
+		t.Fatalf("unexpected proxy format: %q", resolved.proxy)
+	}
+	if matches[1] != matches[2] {
+		t.Fatalf("expected same session key reused in one proxy string, got %q and %q", matches[1], matches[2])
+	}
+}
+
+func TestResolveRuntimeProxyConfigUsesLengthFromPlaceholder(t *testing.T) {
+	cfg := config{
+		proxy: "http://user-{6}:pass-{8}@proxy.example.com:8888",
+	}
+
+	resolved := cfg
+	resolved.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+	matcher := regexp.MustCompile(`^http://user-([A-Za-z0-9]+):pass-([A-Za-z0-9]+)@proxy\.example\.com:8888$`)
+	matches := matcher.FindStringSubmatch(resolved.proxy)
+	if len(matches) != 3 {
+		t.Fatalf("unexpected proxy format: %q", resolved.proxy)
+	}
+	if len(matches[1]) != 6 {
+		t.Fatalf("expected first session key length 6, got %d", len(matches[1]))
+	}
+	if len(matches[2]) != 8 {
+		t.Fatalf("expected second session key length 8, got %d", len(matches[2]))
+	}
+}
+
+func TestResolveRuntimeProxyConfigReusesSessionKeyForSameLength(t *testing.T) {
+	cfg := config{
+		proxy: "http://user-{6}:pass-{6}@proxy.example.com:8888",
+	}
+
+	resolved := cfg
+	resolved.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+	matcher := regexp.MustCompile(`^http://user-([A-Za-z0-9]+):pass-([A-Za-z0-9]+)@proxy\.example\.com:8888$`)
+	matches := matcher.FindStringSubmatch(resolved.proxy)
+	if len(matches) != 3 {
+		t.Fatalf("unexpected proxy format: %q", resolved.proxy)
+	}
+	if matches[1] != matches[2] {
+		t.Fatalf("expected same-length placeholders to reuse one key, got %q and %q", matches[1], matches[2])
 	}
 }
