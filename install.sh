@@ -5,8 +5,11 @@ set -euo pipefail
 REPO="${GITHUB_REPO:-wdaglb/gpt-register}"
 BINARY_NAME="${GO_REGISTER_BINARY_NAME:-go-register}"
 TAG="${GO_REGISTER_TAG:-latest}"
-INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
-WORK_DIR="${WORK_DIR:-$(pwd)}"
+# Why: 安装脚本默认把二进制和运行态文件都收口到同一个目录，
+# 避免用户还要额外区分 PATH 下的二进制目录和项目运行目录。
+DEFAULT_APP_DIR="${HOME}/gpt-register"
+INSTALL_DIR="${INSTALL_DIR:-${DEFAULT_APP_DIR}}"
+WORK_DIR="${WORK_DIR:-${DEFAULT_APP_DIR}}"
 TMP_DIR="$(mktemp -d)"
 
 log() {
@@ -113,12 +116,14 @@ print_next_steps() {
 
 [install] 安装完成。
 [install] 下一步建议：
-1. 编辑 ${WORK_DIR}/emails.txt，填入邮箱池数据，格式：
+1. 进入安装目录：
+   cd ${WORK_DIR}
+2. 编辑 ./emails.txt，填入邮箱池数据，格式：
    email@example.com----password----client_id----refresh_token
-2. 启动内置 web_mail：
-   ${INSTALL_DIR}/${BINARY_NAME} -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ${WORK_DIR}/emails.txt
-3. 启动主程序（TUI 推荐）：
-   ${INSTALL_DIR}/${BINARY_NAME} -accounts-file ${WORK_DIR}/accounts.txt -proxy http://127.0.0.1:7890 -web-mail-url http://127.0.0.1:8030
+3. 启动内置 web_mail：
+   ./${BINARY_NAME} -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ./emails.txt
+4. 启动主程序（TUI 推荐）：
+   ./${BINARY_NAME} -accounts-file ./accounts.txt -proxy http://127.0.0.1:7890 -web-mail-url http://127.0.0.1:8030
 
 [install] 可选环境变量：
 - GITHUB_REPO=${REPO}

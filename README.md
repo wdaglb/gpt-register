@@ -1,32 +1,31 @@
 # go-register
 
-使用 Go 纯协议实现 OpenAI 账号注册与 OAuth 授权，并通过统一的 `accounts.txt` 协调注册线程与授权线程。
+使用 Go 纯协议完成 OpenAI 账号注册、OAuth 授权与本地邮箱池协同。项目内置 Go 版 `web_mail` 服务，并通过统一的 `accounts.txt` 串联注册线程与授权线程。
 
-## 当前能力
+## 功能概览
 
 - 纯协议注册 OpenAI 账号
-- 纯协议执行 OAuth 授权，生成本地 `auth/` 授权文件
-- 对接本地 `web_mail`，注册阶段按 `account_id` 取码，授权阶段按邮箱取码
+- 纯协议执行 OAuth 授权，并在本地 `auth/` 目录生成授权文件
 - 内置 Go 版 `web_mail` 服务，兼容历史 Python 版 HTTP 接口
-- 交互终端下默认进入 TUI 首页（worker 卡片列表）
-- TUI 底部固定展示注册/授权统计与平均注册速度
-- TUI 配置会持久化到项目根目录 `.config.json`
-- 支持五种执行模式：
-  - `webmail`：只启动邮箱池 HTTP 服务
-  - `register`：只注册
-  - `authorize`：只授权
-  - `pipeline`：注册线程与授权线程独立运行，共享 `accounts.txt`，注册达标后仍会等待授权线程收尾
-  - `login`：单账号登录调试
-- 使用线程锁 + 文件锁保护 `accounts.txt`，避免并发写乱
+- 支持 `register`、`authorize`、`pipeline`、`login`、`webmail` 五种模式
+- 交互终端默认进入 TUI 首页，支持配置持久化与 worker 卡片视图
+- 使用线程锁 + 文件锁保护 `accounts.txt`，避免并发写入互相覆盖
 
-## 二进制安装（GitHub Release）
+## 目录与运行文件
 
-当前仓库支持两种自动发布：
+程序运行过程中主要会读写以下文件：
 
-- `main` 分支 push：自动更新 `latest` Release
-- 推送 `v*` tag：自动发布同名版本 Release，例如 `v1.0.0`
+- `emails.txt`：邮箱池数据源，也是 `web_mail` 的持久化文件
+- `accounts.txt`：注册 / 授权状态文件
+- `auth/`：OAuth 授权成功后生成的本地授权文件目录
+- `user.txt`：`login` 模式单账号调试时的兜底账号文件
+- `.config.json`：TUI 配置持久化文件，仅交互模式使用
 
-自动构建以下平台二进制：
+## 安装方式
+
+### 方式一：通过 GitHub Release 安装
+
+仓库已支持自动发布以下平台的二进制：
 
 - Linux amd64
 - Linux arm64
@@ -49,28 +48,64 @@ curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh
 可选环境变量：
 
 - `GO_REGISTER_TAG`：指定下载的 Release tag，默认 `latest`
-- `INSTALL_DIR`：二进制安装目录，默认 `$HOME/.local/bin`
-- `WORK_DIR`：运行目录，默认执行脚本时的当前目录
+- `INSTALL_DIR`：二进制安装目录，默认 `~/gpt-register`
+- `WORK_DIR`：运行目录，默认 `~/gpt-register`
+- `GITHUB_REPO`：Release 仓库地址，默认 `wdaglb/gpt-register`
 
-安装完成后，会自动创建：
+安装完成后会自动创建：
 
 - `auth/`
 - `accounts.txt`
 - `emails.txt`
 - `user.txt`
 
-> 下面的二进制运行示例默认你已经执行过 `install.sh`，并且 `go-register` 已在 `PATH` 中。  
-> 如果 `~/.local/bin` 没加入 `PATH`，请把命令里的 `go-register` 替换成 `~/.local/bin/go-register`。
+默认安装后目录结构如下：
 
-## 运行前准备
+```text
+~/gpt-register/
+├── go-register
+├── accounts.txt
+├── emails.txt
+├── user.txt
+└── auth/
+```
 
-1. 准备邮箱池 txt 数据库 `emails.txt`，基础格式如下：
+> `install.sh` 只负责 Linux / macOS 下的安装流程。Windows 请直接从 Release 页面下载对应压缩包。
+
+安装完成后，推荐先进入该目录再运行：
+
+```bash
+cd ~/gpt-register
+./go-register -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ./emails.txt
+```
+
+### 方式二：本地源码构建
+
+项目当前使用 Go 1.26：
+
+```bash
+go build -o go-register .
+```
+
+构建完成后，可直接使用当前目录下的 `./go-register` 运行。
+
+## 快速开始
+
+以下运行示例默认你已经通过 `install.sh` 安装完成，并且当前位于 `~/gpt-register` 目录：
+
+```bash
+cd ~/gpt-register
+```
+
+### 1. 准备邮箱池文件 `emails.txt`
+
+基础格式如下：
 
 ```text
 email@example.com----password----client_id----refresh_token
 ```
 
-服务启动后会把该文件当作**唯一数据库**直接读写，并在需要时于行尾追加托管字段，例如：
+服务启动后会把该文件当作唯一数据库直接读写，并在需要时于行尾追加托管字段，例如：
 
 ```text
 email@example.com----password----client_id----refresh_token
@@ -78,21 +113,57 @@ email@example.com----password----client_id----refresh_token----lease_token:abc12
 email@example.com----password----client_id----refresh_token----used_at:2026-04-12T12:05:00Z----status:used
 ```
 
-默认 `available` 状态不会单独写出，只有记录处于租出或已使用状态时，服务才会追加 `status`、`lease_token`、`leased_at`、`used_at` 等后缀字段。  
-只有基础四列的旧格式也可以直接使用，缺少的托管字段会在后续状态变更时自动补齐。  
-如果一行里还有额外列，服务会继续保留，并在接口响应的 `extra_fields` 中返回。
+说明：
 
-2. 启动当前仓库内置的 `web_mail` 服务，例如：
+- 默认 `available` 状态不会单独写出
+- 只有记录进入租出或已使用状态时，才会追加 `status`、`lease_token`、`leased_at`、`used_at` 等后缀字段
+- 仅包含基础四列的旧格式也可以直接使用
+- 如果一行里还有额外列，服务会保留这些字段，并在接口响应的 `extra_fields` 中返回
+
+### 2. 启动内置 `web_mail` 服务
 
 ```bash
-go-register \
+./go-register \
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
-  -web-mail-emails-file emails.txt
+  -web-mail-emails-file ./emails.txt
 ```
 
-3. 确认本机代理可访问：
+如果只想先把 `emails.txt` 同步进内存并立即退出：
+
+```bash
+./go-register \
+  -mode webmail \
+  -web-mail-sync-only \
+  -web-mail-emails-file ./emails.txt
+```
+
+后台运行示例：
+
+```bash
+nohup ./go-register -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ./emails.txt > webmail.log 2>&1 &
+```
+
+常用排查命令：
+
+```bash
+tail -f webmail.log
+```
+
+```bash
+ps aux | grep './go-register -mode webmail'
+```
+
+后台停止示例：
+
+```bash
+pkill -f './go-register -mode webmail'
+```
+
+### 3. 准备代理
+
+运行前请确认本机代理可访问：
 
 ```text
 chatgpt.com
@@ -101,29 +172,32 @@ sentinel.openai.com
 auth-cdn.oaistatic.com
 ```
 
-## TUI 运行方式（推荐）
+### 4. 启动主程序
 
-在交互终端里直接运行：
+推荐直接进入 TUI：
 
 ```bash
-go-register \
-  -accounts-file accounts.txt \
+./go-register \
+  -accounts-file ./accounts.txt \
   -proxy http://127.0.0.1:7890 \
   -web-mail-url http://127.0.0.1:8030
 ```
 
-启动后默认先进入 **首页（worker 卡片列表）**。首页只展示：
+## TUI 使用说明
+
+在交互终端里运行时，程序默认进入 TUI 首页。首页主要包含：
 
 - 系统日志卡片
-- 按当前配置推导出的注册 / 授权 worker 占位卡片
-- 底部统计栏与快捷键提示
+- 注册 / 授权 worker 卡片
+- 底部统计栏
+- 快捷键提示
 
-按 `c` 进入独立的 **配置页**，在该页内配置：
+配置页可配置：
 
 - `mode`
 - `web-mail-url`
-- `email` / `password`（**仅 `login` 模式使用**）
-- `user-file`（**仅 `login` 模式在未填写 `email/password` 时兜底**）
+- `email` / `password`（仅 `login` 模式使用）
+- `user-file`（仅 `login` 模式在未填写 `email/password` 时兜底）
 - `auth-dir`
 - `accounts-file`
 - `proxy`
@@ -136,37 +210,36 @@ go-register \
 - `poll-interval`
 - `request-timeout`
 
-配置页可以先点“保存配置”落盘；回到首页后按 `Enter` 或 `Ctrl+S` 开始运行。首页包含：
+配置页可先保存配置，再回到首页按 `Enter` 或 `Ctrl+S` 启动任务。
 
-- 顶部系统日志卡片：汇总主流程与未绑定 worker 的日志
-- 注册 / 授权 worker 卡片：按 worker 展示当前账号、最后状态和最近日志
-- 底部固定统计栏：
+### TUI 首页显示内容
+
+- 系统日志卡片：汇总主流程日志
+- 底部统计栏：
   - 注册成功数量
   - 注册失败数量
-  - 授权成功数
-  - 授权失败数
-  - 平均注册速度（秒/个）
+  - 授权成功数量
+  - 授权失败数量
+  - 平均注册速度（秒 / 个）
 
-任务结束后程序会继续停留在首页；此时仍可按 `c` 回到配置页修改参数，并在首页再次开始新任务。
-
-> 注意：`register` / `authorize` / `pipeline` 三种模式都不会读取“登录邮箱 / 登录密码 / 账号文件”。这些字段只服务于 `login` 单账号登录调试。
+任务结束后程序会继续停留在首页，便于修改配置后再次启动下一轮任务。
 
 ### TUI 快捷键
 
 | 按键 | 作用 |
 | --- | --- |
-| `Tab` | 首页切换到下一张卡片；配置页内切换到下一个字段 |
-| `Shift+Tab` | 配置页首字段返回首页；其它位置切换到上一个字段 |
-| `左右键` | 首页切换卡片；配置页切换 `mode` |
-| `上下键` | 首页滚动当前焦点卡片日志；配置页切换字段 |
+| `Tab` | 首页切换到下一张卡片；配置页切换到下一个字段 |
+| `Shift+Tab` | 配置页首字段返回首页；其他位置切换到上一个字段 |
+| `←` / `→` | 首页切换卡片；配置页切换 `mode` |
+| `↑` / `↓` | 首页滚动当前卡片日志；配置页切换字段 |
 | `c` | 首页进入配置页 |
-| `Enter` | 首页开始运行；配置页内跳到下一项，或在“保存配置”上提交 |
+| `Enter` | 首页开始运行；配置页跳到下一项，或在“保存配置”上提交 |
 | `Ctrl+S` | 首页开始运行；配置页保存配置 |
 | `Ctrl+C` | 退出 |
 
 ### TUI 配置持久化
 
-TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
+TUI 会在项目根目录读写 `.config.json`，典型内容如下：
 
 ```json
 {
@@ -192,16 +265,115 @@ TUI 会在项目根目录读写 `.config.json`，当前持久化字段如下：
 说明：
 
 - 启动 TUI 时会自动读取 `.config.json`
-- 点击“保存配置”或从首页开始运行时，都会自动保存当前页面配置
+- 点击“保存配置”或从首页开始运行时，都会自动保存当前配置
 - `.config.json` 已加入 `.gitignore`
-- `webmail` 模式不会进入 TUI，因此不会消费这份持久化配置
+- `webmail` 模式固定走 CLI，不进入 TUI
 
-## 模式 0：只启动 web_mail 服务
+## 非交互 / 脚本模式
 
-该模式会在当前仓库内启动一个兼容历史 Python 版接口的邮箱池 HTTP 服务：
+当输出被重定向、运行在非交互终端，或你明确希望通过脚本运行时，可以直接使用 CLI 参数控制。
+
+### 模式 1：只注册
 
 ```bash
-go-register \
+./go-register \
+  -mode register \
+  -accounts-file ./accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030 \
+  -count 3 \
+  -workers 2
+```
+
+行为：
+
+- 注册成功：写入 `register_status=ok` 与 `register_time`
+- 同时初始化 `oauth_status=oauth=pending`
+- 注册失败：写入 `fail:<reason>`
+
+### 模式 2：只授权
+
+```bash
+./go-register \
+  -mode authorize \
+  -accounts-file ./accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030 \
+  -workers 2
+```
+
+筛选规则：
+
+- `register_status == ok`
+- `oauth_status != oauth=ok`
+
+行为：
+
+- 授权成功：回写 `oauth=ok`、`oauth_time`、`auth_file_path`
+- 授权失败：回写 `oauth=fail:<reason>`
+
+### 模式 3：注册 + 授权流水线
+
+```bash
+./go-register \
+  -mode pipeline \
+  -accounts-file ./accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030 \
+  -count 5 \
+  -workers 2 \
+  -authorize-workers 2
+```
+
+行为：
+
+- 注册线程持续产出新账号
+- 账号注册成功后会立刻写入 `accounts.txt`
+- 授权线程继续消费这些新账号完成 OAuth 授权
+- `count` 表示目标注册成功数；注册达标后，程序仍会等待已入队账号授权结束
+
+### 模式 4：单账号登录调试
+
+显式传入邮箱和密码：
+
+```bash
+./go-register \
+  -mode login \
+  -email your_openai_account@example.com \
+  -password 'YourOpenAIPassword!' \
+  -accounts-file ./accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030
+```
+
+如果不想在命令行中直接写账号密码，也可以准备 `user.txt`：
+
+```text
+your_openai_account@example.com
+YourOpenAIPassword!
+```
+
+或者使用单行兼容格式：
+
+```text
+your_openai_account@example.com----YourOpenAIPassword!
+```
+
+随后执行：
+
+```bash
+./go-register \
+  -mode login \
+  -user-file ./user.txt \
+  -accounts-file ./accounts.txt \
+  -proxy http://127.0.0.1:7890 \
+  -web-mail-url http://127.0.0.1:8030
+```
+
+### 模式 5：只启动 `web_mail`
+
+```bash
+./go-register \
   -mode webmail \
   -web-mail-host 127.0.0.1 \
   -web-mail-port 8030 \
@@ -210,45 +382,9 @@ go-register \
   -web-mail-lease-timeout-seconds 600
 ```
 
-只同步邮箱文件后退出：
+## 数据文件格式
 
-```bash
-go-register \
-  -mode webmail \
-  -web-mail-sync-only \
-  -web-mail-emails-file ./emails.txt
-```
-
-提供的 HTTP 接口：
-
-- `GET /health`
-- `GET /api/email-pool/stats`
-- `POST /api/email-pool/lease`
-- `POST /api/email-pool/accounts/{id}/mark-used`
-- `POST /api/email-pool/accounts/{id}/return`
-- `GET/POST /api/email-pool/accounts/{id}/latest`
-- `GET/POST /api/email-pool/accounts/by-email/latest`
-- `POST /api/email-pool/sync`
-
-响应结构保持兼容：
-
-```json
-{
-  "ok": true,
-  "data": {}
-}
-```
-
-失败时：
-
-```json
-{
-  "ok": false,
-  "error": "错误信息"
-}
-```
-
-## accounts.txt 格式
+### `accounts.txt`
 
 当前统一使用一行一条账号记录：
 
@@ -268,129 +404,81 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 
 | 字段 | 说明 |
 | --- | --- |
-| `register_status` | 注册结果，如 `ok`、`fail:create_account` |
+| `register_status` | 注册结果，例如 `ok`、`fail:create_account` |
 | `register_time` | 注册完成时间 |
-| `oauth_status` | 授权结果，如 `oauth=pending`、`oauth=ok`、`oauth=fail:add_phone` |
+| `oauth_status` | 授权结果，例如 `oauth=pending`、`oauth=ok`、`oauth=fail:add_phone` |
 | `oauth_time` | 最近一次授权完成时间 |
 | `auth_file_path` | 授权成功后生成的本地 auth 文件路径 |
 
-## 非交互 / 脚本模式
+## `web_mail` HTTP 接口
 
-当输出被重定向、运行在非交互终端，或你明确想走脚本方式时，仍可直接通过 CLI 参数控制模式和并发。
+当前内置服务兼容以下接口：
 
-## 模式 1：只注册
+- `GET /health`
+- `GET /api/email-pool/stats`
+- `POST /api/email-pool/lease`
+- `POST /api/email-pool/accounts/{id}/mark-used`
+- `POST /api/email-pool/accounts/{id}/return`
+- `GET /api/email-pool/accounts/{id}/latest`
+- `POST /api/email-pool/accounts/{id}/latest`
+- `GET /api/email-pool/accounts/by-email/latest`
+- `POST /api/email-pool/accounts/by-email/latest`
+- `POST /api/email-pool/sync`
 
-只负责注册，并在账号注册成功后立即把账号写入 `accounts.txt`：
+响应结构：
 
-```bash
-go-register \
-  -mode register \
-  -accounts-file accounts.txt \
-  -proxy http://127.0.0.1:7890 \
-  -web-mail-url http://127.0.0.1:8030 \
-  -count 3 \
-  -workers 2
+```json
+{
+  "ok": true,
+  "data": {}
+}
 ```
 
-行为：
+失败时：
 
-- 注册成功：写入 `register_status=ok` 和 `register_time`
-- 同时初始化 `oauth_status=oauth=pending`
-- 注册失败：写入 `fail:<reason>`
-
-## 模式 2：只授权
-
-从 `accounts.txt` 中筛出“已注册成功但未授权成功”的账号，批量执行授权：
-
-```bash
-go-register \
-  -mode authorize \
-  -accounts-file accounts.txt \
-  -proxy http://127.0.0.1:7890 \
-  -web-mail-url http://127.0.0.1:8030 \
-  -workers 2
-```
-
-筛选规则：
-
-- `register_status == ok`
-- `oauth_status != oauth=ok`
-
-行为：
-
-- 授权成功：回写 `oauth=ok`、`oauth_time`、`auth_file_path`
-- 授权失败：回写 `oauth=fail:<reason>`
-
-## 模式 3：注册 + 授权流水线
-
-注册线程和授权线程独立运行，但共享同一个 `accounts.txt`：
-
-```bash
-go-register \
-  -mode pipeline \
-  -accounts-file accounts.txt \
-  -proxy http://127.0.0.1:7890 \
-  -web-mail-url http://127.0.0.1:8030 \
-  -count 5 \
-  -workers 2 \
-  -authorize-workers 2
-```
-
-行为：
-
-- 注册线程负责持续产出新账号
-- 账号一旦注册成功，会立刻写入 `accounts.txt`
-- 授权线程从注册线程投递过来的账号继续跑授权
-- `accounts.txt` 由统一状态存储层负责加锁更新，避免并发覆盖
-
-## 模式 4：单账号登录调试
-
-保留历史 `login` 模式，便于单账号调试 OAuth 登录闭环：
-
-```bash
-go-register \
-  -mode login \
-  -email your_openai_account@example.com \
-  -password 'YourOpenAIPassword!' \
-  -accounts-file accounts.txt \
-  -proxy http://127.0.0.1:7890 \
-  -web-mail-url http://127.0.0.1:8030
+```json
+{
+  "ok": false,
+  "error": "错误信息"
+}
 ```
 
 ## 常用参数
 
 | 参数 | 说明 |
 | --- | --- |
-| `-mode` | `webmail` / `register` / `authorize` / `pipeline` / `login`。交互终端下会被 TUI 页面中的 mode 覆盖，`webmail` 模式固定走 CLI |
-| `-accounts-file` | 统一账号状态文件，默认 `accounts.txt` |
+| `-mode` | `register` / `authorize` / `pipeline` / `login` / `webmail` |
+| `-accounts-file` | 账号状态文件路径，默认 `accounts.txt` |
 | `-web-mail-url` | `web_mail` 服务地址，默认 `http://127.0.0.1:8030` |
 | `-web-mail-host` | `webmail` 模式监听地址，默认 `127.0.0.1` |
 | `-web-mail-port` | `webmail` 模式监听端口，默认 `8030` |
-| `-web-mail-db` | 已废弃兼容参数，当前 `web_mail` 不再使用 SQLite |
-| `-web-mail-emails-file` | `webmail` 模式邮箱池 txt 数据库路径，默认项目根目录 `emails.txt` |
-| `-mail-api-base` | `webmail` 模式上游邮件接口基础地址，默认 `https://www.appleemail.top` |
+| `-web-mail-emails-file` | `webmail` 模式邮箱池 txt 文件路径，默认当前项目根目录 `emails.txt` |
+| `-mail-api-base` | `webmail` 模式上游邮件接口基础地址 |
 | `-web-mail-sync-only` | `webmail` 模式只同步一次邮箱文件后退出 |
-| `-web-mail-lease-timeout-seconds` | `webmail` 模式租约超时秒数，默认 `600` |
-| `-proxy` | HTTP/HTTPS 代理地址 |
-| `-count` | 注册数量。`register` 模式表示注册尝试数；`pipeline` 模式表示目标注册成功数，注册达标后仍会等待已入队账号授权完成；若邮箱池提示“当前没有可用邮箱账号”，会停止继续补注册 |
-| `-workers` | 注册并发数，或 `authorize` 模式的授权并发数。交互终端下会被 TUI 页面中的 workers 覆盖 |
-| `-authorize-workers` | `pipeline` 模式下的授权并发数。交互终端下会被 TUI 页面中的 authorize-workers 覆盖 |
-| `-mailbox` | 优先轮询的邮箱目录，默认 `Junk` |
-| `-otp-timeout` | 单次验证码等待时间 |
-| `-poll-interval` | 收码轮询间隔 |
-| `-timeout` | 单个账号整条流程超时 |
-| `-request-timeout` | 单次 HTTP 请求超时 |
+| `-web-mail-lease-timeout-seconds` | `webmail` 模式邮箱租约超时秒数，默认 `600` |
+| `-email` | `login` 模式账号邮箱；为空时从 `user-file` 读取 |
+| `-password` | `login` 模式账号密码；为空时从 `user-file` 读取 |
+| `-user-file` | `login` 模式账号文件，支持两行 `email/password` 或单行 `email----password` |
 | `-auth-dir` | 授权文件输出目录，默认 `auth` |
+| `-proxy` | HTTP / HTTPS 代理地址 |
+| `-mailbox` | 验证码轮询优先邮箱目录，默认 `Junk` |
+| `-count` | `register` / `pipeline` 模式的注册数量 |
+| `-workers` | `register` 模式注册并发数，或 `authorize` 模式授权并发数 |
+| `-authorize-workers` | `pipeline` 模式的授权并发数 |
+| `-timeout` | 单个账号整条流程超时，默认 `4m` |
+| `-otp-timeout` | 单次验证码等待超时，默认 `90s` |
+| `-poll-interval` | 收码轮询间隔，默认 `3s` |
+| `-request-timeout` | 单次 HTTP 请求超时，默认 `20s` |
 
 ## 运行输出
 
 交互终端下默认使用 TUI：
 
-- `logger` 日志会按系统卡片和 worker 卡片拆分展示
+- 系统日志与 worker 日志按卡片拆分展示
 - 失败原因会直接显示在对应卡片的最近日志里
-- 底部统计栏会持续更新注册/授权结果
+- 底部统计栏会持续刷新注册 / 授权结果
 
-非交互 / 脚本模式下，仍会直接输出普通日志，例如：
+非交互模式下会直接输出普通日志，例如：
 
 ```text
 注册失败账号=demo@example.com reason=create_account err=...
@@ -398,10 +486,10 @@ go-register \
 pipeline 授权失败账号=demo@example.com status=oauth=fail:add_phone err=...
 ```
 
-## 说明
+## 说明与限制
 
-- 当前仓库已经内置 Go 版 `web_mail` 服务，不再依赖外部 Python `email_pool_service.py`
-- 注册模式严格按 `http_register.py` 的顺序推进：拿注册会话 → 提交邮箱 → 设置密码 → 发验证码 → 收码 → 验证 → `create_account`
-- OAuth 模式会继续推进：邮箱 → 密码 → 邮箱 OTP → consent / callback → `oauth/token`
-- 对于落入 `add_phone` 的账号，当前会明确标记失败，不尝试绕过手机验证
-- 若 OpenAI 再次调整注册页接口、consent 页表单结构或 Sentinel flow 名称，需要同步更新协议步骤
+- 当前仓库已经内置 Go 版 `web_mail` 服务
+- `register` 模式会按“拿注册会话 → 提交邮箱 → 设置密码 → 发验证码 → 收码 → 验证 → create_account”推进
+- OAuth 链路会继续完成“邮箱 → 密码 → 邮箱 OTP → consent / callback → oauth/token”
+- 命中 `add_phone` 的账号当前会明确标记失败，不尝试绕过手机验证
+- 如果 OpenAI 再次调整页面接口、consent 表单结构或 Sentinel 流程名称，需要同步更新协议实现
