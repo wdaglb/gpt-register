@@ -25,11 +25,10 @@ type cpaUploadResponse struct {
 // Why: 当前 Go 版本已经能在本地生成可直接使用的 auth 文件，因此这里直接上传产物，
 // 不再复刻 Python 脚本里“重新向 CPA 申请授权链接再转发 callback”的整条外部链路。
 func maybeUploadAuthFileToCPA(ctx context.Context, cfg config, email, authFilePath string) (bool, error) {
-	if strings.TrimSpace(cfg.cpaURL) == "" {
+	if strings.TrimSpace(cfg.cpaURL) == "" || strings.TrimSpace(cfg.cpaKey) == "" {
+		// Why: 用户把任一配置留空时，说明当前运行不希望触发 CPA 同步；
+		// 这里直接静默跳过，避免因为半配置状态把本地授权链路误判为失败。
 		return false, nil
-	}
-	if strings.TrimSpace(cfg.cpaKey) == "" {
-		return false, fmt.Errorf("已配置 cpa-url 但缺少 cpa-key")
 	}
 	if strings.TrimSpace(authFilePath) == "" {
 		return false, fmt.Errorf("账号 %s 的 auth 文件路径为空", strings.TrimSpace(email))

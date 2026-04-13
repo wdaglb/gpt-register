@@ -23,15 +23,15 @@ func TestMaybeUploadAuthFileToCPASkipsWhenURLMissing(t *testing.T) {
 	}
 }
 
-func TestMaybeUploadAuthFileToCPAReturnsErrorWhenKeyMissing(t *testing.T) {
+func TestMaybeUploadAuthFileToCPASkipsWhenKeyMissing(t *testing.T) {
 	t.Parallel()
 
 	attempted, err := maybeUploadAuthFileToCPA(context.Background(), config{cpaURL: "http://127.0.0.1:8317"}, "demo@example.com", "auth/demo.json")
-	if err == nil {
-		t.Fatal("expected missing cpa-key to return error")
+	if err != nil {
+		t.Fatalf("expected skip without error, got %v", err)
 	}
 	if attempted {
-		t.Fatal("expected missing cpa-key to stop before HTTP request")
+		t.Fatal("expected upload to be skipped when cpa-key is empty")
 	}
 }
 

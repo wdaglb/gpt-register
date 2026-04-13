@@ -57,7 +57,7 @@ type loginAccount struct {
 	password string
 }
 
-const appVersion = "v0.1.5"
+const appVersion = "v0.1.7"
 
 func main() {
 	usedTUI, err := run(context.Background(), os.Args[1:])

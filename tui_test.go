@@ -51,8 +51,8 @@ func TestBuildTUIRunConfig(t *testing.T) {
 		"user.txt",
 		"auth",
 		"accounts.txt",
-		"http://127.0.0.1:8317",
-		"932452",
+		"",
+		"",
 		"http://127.0.0.1:7890",
 		"Junk",
 		"20",
@@ -73,7 +73,7 @@ func TestBuildTUIRunConfig(t *testing.T) {
 	if cfg.webMailURL != "http://127.0.0.1:8030" || cfg.email != "demo@example.com" || cfg.password != "password" || cfg.userFile != "user.txt" {
 		t.Fatalf("unexpected config strings: %+v", cfg)
 	}
-	if cfg.cpaURL != "http://127.0.0.1:8317" || cfg.cpaKey != "932452" {
+	if cfg.cpaURL != "" || cfg.cpaKey != "" {
 		t.Fatalf("unexpected CPA config: %+v", cfg)
 	}
 	if cfg.overallTimeout != 5*time.Minute || cfg.otpTimeout != 2*time.Minute || cfg.pollInterval != 5*time.Second || cfg.requestTimeout != 30*time.Second {
