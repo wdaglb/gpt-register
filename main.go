@@ -127,10 +127,15 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 	}
 
 	logger.Printf("准备登录账号: %s", account.email)
+	threadLabel := "login"
+	resolvedCfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
+	loginPrefix := buildFlowLogPrefix(threadLabel, flowIP, account.email)
+	flowLogger := newFlowScopedLogger(logger, loginPrefix)
 	loginCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
-	result, err := loginWithProtocol(loginCtx, cfg, account, mailClient, logger)
+	logger.Printf("%s 开始登录流程", loginPrefix)
+	result, err := loginWithProtocol(loginCtx, resolvedCfg, account, mailClient, flowLogger)
 	if err != nil {
 		ui.RecordAuthorizeFinish(false)
 		if store != nil {
@@ -139,6 +144,7 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 				return errors.Join(err, writeErr)
 			}
 		}
+		logger.Printf("%s 登录失败: %v", loginPrefix, err)
 		return err
 	}
 
@@ -148,8 +154,8 @@ func runLogin(parent context.Context, cfg config, mailClient *webMailClient, log
 			return err
 		}
 	}
-	logger.Printf("授权文件已生成: %s", result.AuthFilePath)
-	logger.Printf("callback=%s", result.CallbackURL)
+	logger.Printf("%s 授权文件已生成: %s", loginPrefix, result.AuthFilePath)
+	logger.Printf("%s callback=%s", loginPrefix, result.CallbackURL)
 	return nil
 }
 

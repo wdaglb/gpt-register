@@ -311,7 +311,8 @@ func isLeaseFailureReason(reason string) bool {
 // runRegisterAttempt 负责单个邮箱租约的一次完整注册尝试。
 // 核心流程：租号 -> 纯协议注册 -> 立即写入 accounts.txt -> 成功标记 used / 失败归还租约。
 func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, ui progressUI, authorizeInline bool, workerID int) registrationAttemptResult {
-	cfg.proxy = utils.ResolveProxyPlaceholders(cfg.proxy)
+	threadLabel := fmt.Sprintf("worker-%d", workerID)
+	cfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
@@ -328,13 +329,13 @@ func runRegisterAttempt(parent context.Context, cfg config, mailClient *webMailC
 		if result.Stop {
 			result.Reason = "lease_account_unavailable"
 		}
-		logger.Printf("[worker-%d] 租用邮箱失败: %v", workerID, err)
+		logger.Printf("%s 租用邮箱失败: %v", buildFlowLogPrefix(threadLabel, flowIP, ""), err)
 		return result
 	}
 
 	result.Email = lease.Email
 	result.Password = generateRegistrationPassword()
-	prefix := fmt.Sprintf("[worker-%d][%s]", workerID, lease.Email)
+	prefix := buildFlowLogPrefix(threadLabel, flowIP, lease.Email)
 	logger.Printf("%s 已租到邮箱 account_id=%d", prefix, lease.ID)
 
 	client, err := newProtocolClient(cfg, logger)

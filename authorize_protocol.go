@@ -118,10 +118,12 @@ func collectAuthorizationResults(results <-chan authorizationAttemptResult, logg
 
 // runAuthorizeAttempt 负责单个账号的一次 OAuth 授权尝试，并把结果回写到 accounts.txt。
 func runAuthorizeAttempt(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, workerID int, record accountRecord) authorizationAttemptResult {
+	threadLabel := fmt.Sprintf("auth-%d", workerID)
+	cfg, flowIP := prepareFlowLogging(parent, cfg, logger, threadLabel)
 	attemptCtx, cancel := context.WithTimeout(parent, cfg.overallTimeout)
 	defer cancel()
 
-	prefix := fmt.Sprintf("[auth-%d][%s]", workerID, record.Email)
+	prefix := buildFlowLogPrefix(threadLabel, flowIP, record.Email)
 	logger.Printf("%s 开始授权", prefix)
 	return authorizeAccountWithClient(attemptCtx, cfg, mailClient, logger, store, record, nil, prefix)
 }
@@ -129,6 +131,7 @@ func runAuthorizeAttempt(parent context.Context, cfg config, mailClient *webMail
 // authorizeAccountWithClient 统一执行授权并回写 oauth 状态；当客户端非空时复用现有浏览器链路。
 // Why: pipeline 需要注册后立刻沿用同一 protocolClient 继续 OAuth，而独立授权模式仍可以按旧路径新建客户端。
 func authorizeAccountWithClient(parent context.Context, cfg config, mailClient *webMailClient, logger *log.Logger, store *accountsStore, record accountRecord, client *protocolClient, prefix string) authorizationAttemptResult {
+	flowLogger := newFlowScopedLogger(logger, prefix)
 	var (
 		result *protocolLoginResult
 		err    error
@@ -137,12 +140,12 @@ func authorizeAccountWithClient(parent context.Context, cfg config, mailClient *
 		result, err = loginWithProtocol(parent, cfg, loginAccount{
 			email:    record.Email,
 			password: record.Password,
-		}, mailClient, logger)
+		}, mailClient, flowLogger)
 	} else {
 		result, err = loginWithProtocolClient(parent, cfg, loginAccount{
 			email:    record.Email,
 			password: record.Password,
-		}, mailClient, logger, client)
+		}, mailClient, flowLogger, client)
 	}
 	if err != nil {
 		reason := summarizeFlowReason(err)
