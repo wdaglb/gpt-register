@@ -31,6 +31,19 @@ cleanup() {
 
 trap cleanup EXIT
 
+write_file_if_missing() {
+  local path="$1"
+  local content="$2"
+
+  if [[ -e "${path}" ]]; then
+    warn "检测到已存在文件，跳过覆盖: ${path}"
+    return
+  fi
+
+  mkdir -p "$(dirname "${path}")"
+  printf '%s' "${content}" > "${path}"
+}
+
 resolve_platform() {
   local os_name
   local arch_name
@@ -108,7 +121,36 @@ prepare_runtime_files() {
   touch "${WORK_DIR}/accounts.txt"
   touch "${WORK_DIR}/emails.txt"
   touch "${WORK_DIR}/user.txt"
+  write_default_config
   log "已初始化运行目录: ${WORK_DIR}"
+}
+
+write_default_config() {
+  local config_path="${WORK_DIR}/.config.json"
+
+  # Why: 安装脚本直接生成一份可运行的默认配置，用户首次进入 TUI 时可以立刻看到完整参数，
+  # 同时通过“已存在则跳过”避免重装时覆盖用户手工修改过的配置。
+  write_file_if_missing "${config_path}" "$(cat <<EOF
+{
+  "mode": "pipeline",
+  "web-mail-url": "http://127.0.0.1:8030",
+  "email": "",
+  "password": "",
+  "user-file": "user.txt",
+  "auth-dir": "auth",
+  "accounts-file": "accounts.txt",
+  "proxy": "http://127.0.0.1:7890",
+  "mailbox": "Junk",
+  "count": 5,
+  "workers": 2,
+  "authorize-workers": 2,
+  "timeout": "4m0s",
+  "otp-timeout": "1m30s",
+  "poll-interval": "3s",
+  "request-timeout": "20s"
+}
+EOF
+)"
 }
 
 print_next_steps() {
@@ -120,9 +162,11 @@ print_next_steps() {
    cd ${WORK_DIR}
 2. 编辑 ./emails.txt，填入邮箱池数据，格式：
    email@example.com----password----client_id----refresh_token
-3. 启动内置 web_mail：
+3. 默认配置文件：
+   ./.config.json
+4. 启动内置 web_mail：
    ./${BINARY_NAME} -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ./emails.txt
-4. 启动主程序（TUI 推荐）：
+5. 启动主程序（TUI 推荐）：
    ./${BINARY_NAME} -accounts-file ./accounts.txt -proxy http://127.0.0.1:7890 -web-mail-url http://127.0.0.1:8030
 
 [install] 可选环境变量：

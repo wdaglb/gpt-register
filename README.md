@@ -58,6 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh
 - `accounts.txt`
 - `emails.txt`
 - `user.txt`
+- `.config.json`
 
 默认安装后目录结构如下：
 
@@ -77,6 +78,54 @@ curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install.sh
 ```bash
 cd ~/gpt-register
 ./go-register -mode webmail -web-mail-host 127.0.0.1 -web-mail-port 8030 -web-mail-emails-file ./emails.txt
+```
+
+### 方式一补充：安装为 systemd 后台服务
+
+如果你的环境是 Linux + systemd，并且希望把 `webmail` 和 `pipeline` 安装为开机自启后台服务，可以使用仓库内的 `install-system.sh`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install-system.sh | bash
+```
+
+安装内容：
+
+- `go-register-webmail.service`
+- `gpt-register.service`
+
+默认行为：
+
+- 二进制与运行文件安装到 `~/gpt-register`
+- 自动创建 `accounts.txt`、`emails.txt`、`user.txt`、`auth/`
+- 自动生成 `~/gpt-register/.config.json`
+- 自动生成 `/etc/default/go-register-webmail`
+- 自动生成 `/etc/default/gpt-register`
+- 自动执行 `systemctl enable --now`
+
+如需自定义 pipeline 并发或数量，可在执行时覆盖环境变量：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wdaglb/gpt-register/main/install-system.sh | PIPELINE_COUNT=20 PIPELINE_WORKERS=3 PIPELINE_AUTHORIZE_WORKERS=3 bash
+```
+
+安装后常用命令：
+
+```bash
+systemctl status go-register-webmail.service
+systemctl status gpt-register.service
+journalctl -u go-register-webmail.service -f
+journalctl -u gpt-register.service -f
+```
+
+> 注意：`gpt-register.service` 默认运行 `pipeline` 模式；达到目标数量后会正常退出，这属于当前设计行为。
+
+如需调整 systemd 默认参数，可直接编辑：
+
+```bash
+sudo vim /etc/default/go-register-webmail
+sudo vim /etc/default/gpt-register
+sudo systemctl restart go-register-webmail.service
+sudo systemctl restart gpt-register.service
 ```
 
 ### 方式二：本地源码构建

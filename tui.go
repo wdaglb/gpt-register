@@ -309,11 +309,11 @@ type runTUIModel struct {
 	finished   bool
 	finishedAt time.Time
 
-	modeIndex    int
-	focusIndex   int
+	modeIndex       int
+	focusIndex      int
 	homeActionIndex int
-	configError  string
-	configNotice string
+	configError     string
+	configNotice    string
 
 	webMailURLInput       textinput.Model
 	emailInput            textinput.Model
@@ -1103,7 +1103,7 @@ func (model *runTUIModel) renderLogCard(card *tuiLogCard, cardWidth int, focused
 		rows = append(rows, tuiCardSubtitleStyle.Render("最后状态: "+status+"    更新时间: "+updatedAt))
 	}
 
-	rows = append(rows, formatWorkerCardLogRows(card.Logs, model.cardVisibleLogLines(card.Kind), model.cardLogWidth(card.Kind, cardWidth), card.LogOffset)...)
+	rows = append(rows, formatWorkerCardLogRows(card.Logs, model.cardVisibleLogLines(card), model.cardLogWidth(card.Kind, cardWidth), card.LogOffset)...)
 
 	style := tuiLogCardStyle
 	if focused {
@@ -1136,17 +1136,11 @@ func (model *runTUIModel) columnCardWidth() int {
 }
 
 // cardVisibleLogLines 返回不同卡片类型的可见日志行数。
-// Why: 现在系统日志和 worker 卡片都支持内部滚动，必须为不同卡片设置稳定的日志窗口高度。
-func (model *runTUIModel) cardVisibleLogLines(kind string) int {
-	if kind == "system" {
-		switch {
-		case model.height >= 42:
-			return 8
-		case model.height >= 32:
-			return 6
-		default:
-			return 5
-		}
+// Why: 系统日志现在独占首页主体区域，应尽量把 viewport 的可用高度都让给日志本身；
+// worker 卡片仍保持固定窗口，避免未来恢复多卡片布局时单张卡片无限增高。
+func (model *runTUIModel) cardVisibleLogLines(card *tuiLogCard) int {
+	if card != nil && card.Kind == "system" {
+		return model.systemCardVisibleLogLines(card)
 	}
 	switch {
 	case model.height >= 42:
@@ -1156,6 +1150,30 @@ func (model *runTUIModel) cardVisibleLogLines(kind string) int {
 	default:
 		return 3
 	}
+}
+
+// systemCardVisibleLogLines 计算系统日志卡片的动态可见行数。
+// Why: 用户要求系统日志直接占满首页，因此这里按首页 viewport 的实时高度反推日志窗口行数，
+// 而不是继续使用固定的 5~8 行上限。
+func (model *runTUIModel) systemCardVisibleLogLines(card *tuiLogCard) int {
+	if model.viewport.Height <= 0 {
+		switch {
+		case model.height >= 42:
+			return 8
+		case model.height >= 32:
+			return 6
+		default:
+			return 5
+		}
+	}
+	visible := model.viewport.Height - 1
+	if card != nil && strings.TrimSpace(card.Subtitle) != "" {
+		visible--
+	}
+	if visible < 1 {
+		return 1
+	}
+	return visible
 }
 
 // cardLogWidth 返回卡片日志区可安全使用的单行宽度。
@@ -1298,7 +1316,7 @@ func (model *runTUIModel) scrollFocusedCard(delta int) {
 		return
 	}
 
-	maxOffset := maxInt(len(card.Logs)-model.cardVisibleLogLines(card.Kind), 0)
+	maxOffset := maxInt(len(card.Logs)-model.cardVisibleLogLines(card), 0)
 	card.LogOffset += delta
 	if card.LogOffset < 0 {
 		card.LogOffset = 0
