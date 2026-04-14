@@ -580,10 +580,6 @@ demo@example.com----Passw0rd!----ok----2026-04-11 22:37:52----oauth=fail:add_pho
 pipeline 授权失败账号=demo@example.com status=oauth=fail:add_phone err=...
 ```
 
-## 说明与限制
+>
 
-- 当前仓库已经内置 Go 版 `web_mail` 服务
-- `register` 模式会按“拿注册会话 → 提交邮箱 → 设置密码 → 发验证码 → 收码 → 验证 → create_account”推进
-- OAuth 链路会继续完成“邮箱 → 密码 → 邮箱 OTP → consent / callback → oauth/token”
-- 命中 `add_phone` 的账号当前会明确标记失败，不尝试绕过手机验证
-- 如果 OpenAI 再次调整页面接口、consent 表单结构或 Sentinel 流程名称，需要同步更新协议实现
+Finally，Thanks to everyone on LinuxDo for their support! Welcome to join https://linux.do/ for all kinds of technical exchanges, cutting-edge AI information, and AI experience sharing, all on Linuxdo!
